@@ -1,5 +1,5 @@
 {
     "extends": "../../tsconfig.effect.json",
     "compilerOptions": { "noEmit": true, "types": ["node"] },
-    "include": ["test"]
+    "include": ["test", "vitest.config.ts"]
 }
