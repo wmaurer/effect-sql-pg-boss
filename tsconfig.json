@@ -11,5 +11,9 @@
     // project at all — see the comment in that file. It ships referenced so that
     // `pnpm typecheck` covers them and the editor reads the generated mirror for
     // them from the first commit, before any package exists.
-    "references": [{ "path": "tsconfig.tools.json" }, { "path": "packages/effect-sql-pg-boss" }]
+    "references": [
+        { "path": "tsconfig.tools.json" },
+        { "path": "packages/effect-sql-pg-boss" },
+        { "path": "packages/effect-sql-pg-boss/tsconfig.test.json" }
+    ]
 }
