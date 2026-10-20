@@ -95,5 +95,13 @@ export default {
     //
     //   { name: "spec", url: "https://github.com/example/spec.git",
     //     probe: { kind: "none" }, tag: "v{v}", seed: "1.4.0" }
-    deps: [],
+    deps: [
+        {
+            name: "pg-boss",
+            url: "https://github.com/timgit/pg-boss.git",
+            probe: { kind: "npm", pkg: "pg-boss" },
+            tag: "{v}",
+            seed: "12.38.0",
+        },
+    ],
 };
