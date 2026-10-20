@@ -94,11 +94,17 @@ export type JobInsertOptions = Omit<Boss.JobInsert, "data">;
 /**
  * Worker options.
  *
- * `transactional` defaults to `true`: the handler and the batch's completion
- * commit in one transaction on one PgClient connection, held for the
- * handler's whole run. Set `false` for handlers that call slow external
- * services; their writes then commit on their own and pg-boss completes the
- * jobs afterwards on its own connections.
+ * `transactional` is required, because the right mode depends on the handler.
+ * `true`: the handler and the batch's completion commit in one transaction on
+ * one PgClient connection, held for the handler's whole run. Fits handlers
+ * that only write the database. `false`: the handler's writes commit on their
+ * own and pg-boss completes the jobs afterwards on its own connections. Fits
+ * handlers that call slow external services. pg-boss itself defaults to
+ * `false`.
+ *
+ * Transactional workers are not supported on a `PgClient.makeClient` client:
+ * a batch would pin its only connection for the handler's run and stall every
+ * other query of the app.
  *
  * `transactionTimeoutSeconds` exists only on the transactional branch.
  * `perJobResults` and `includeMetadata` are not offered: the first cannot
@@ -119,7 +125,7 @@ export type WorkerOptions = Pick<
     | "heartbeatRefreshSeconds"
 > &
     (
-        | { readonly transactional?: true | undefined; readonly transactionTimeoutSeconds?: number | undefined }
+        | { readonly transactional: true; readonly transactionTimeoutSeconds?: number | undefined }
         | { readonly transactional: false; readonly transactionTimeoutSeconds?: never }
     );
 
@@ -255,12 +261,11 @@ export interface Class<Self, Name extends string, S extends PayloadSchema> exten
      * The handler gets a non-empty batch with decoded payloads, and fails or
      * succeeds as a whole. A payload that does not decode fails the batch.
      *
-     * Transactional (the default): the handler runs inside the transaction
+     * With `transactional: true`, the handler runs inside the transaction
      * pg-boss opened for the batch. `SqlClient` statements, nested
      * `withTransaction` (a savepoint), `afterCommit`, Reactivity, `send`, `flow`
      * and `PgBoss.use` all join it, and pg-boss commits it together with the
      * batch's completion. `afterCommit` callbacks run after that real commit.
-     *
      * A failure, defect or interruption rolls back and fails the batch, with
      * `Cause.pretty` as the stored error. Expiry or `boss.stop()` interrupts the
      * handler before the rollback runs.
@@ -270,7 +275,7 @@ export interface Class<Self, Name extends string, S extends PayloadSchema> exten
      */
     readonly worker: <E, R>(
         handler: (jobs: Arr.NonEmptyReadonlyArray<Job<S["Type"]>>) => Effect.Effect<void, E, R>,
-        options?: WorkerOptions,
+        options: WorkerOptions,
     ) => Layer.Layer<never, PgBossError, Self | R | S["DecodingServices"]>;
 }
 
@@ -318,7 +323,7 @@ export const Service =
         //   static step = (payload, options) => ({ [StepTypeId]: identity, queueName: name, dependsOn: options?.dependsOn ?? [], job: options?.job, encoded: Schema.encodeEffect(codec)(payload) })
         //   static worker = (handler, options) => Layer.effectDiscard(gen:
         //     const runtime = (yield* Key).boss[RuntimeId]
-        //     const { transactional = true, ...work } = options ?? {}
+        //     const { transactional, ...work } = options
         //     if (transactional) yield* runtime.reserveConnections(name, work.localConcurrency ?? 1)
         //     const context = yield* Effect.context<R | DecodingServices>()
         //     const decodeBatch = (jobs) => Effect.forEach(jobs, (job) => Effect.map(Schema.decodeUnknownEffect(codec)(job.data), (data) => toJob(job, data)))

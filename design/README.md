@@ -104,7 +104,7 @@ const ChargeCardWorker = ChargeCard.worker(
 			yield* AuditLog.send({ orderId: job.data.orderId, event: "charged" })
 		}
 	}),
-	{ batchSize: 10, localConcurrency: 2 }
+	{ transactional: true, batchSize: 10, localConcurrency: 2 }
 )
 
 // Wiring.
@@ -115,6 +115,8 @@ const AppLive = ChargeCardWorker.pipe(
 )
 ```
 
+`ChargeCardWorker` only writes the database, so it is transactional. A handler that calls an external service, such as a card processor, would usually be `transactional: false`, so it does not hold a connection and an open transaction while it waits.
+
 The public surface:
 
 - `JobQueue.Service<Self>()(name, { payload, options? })` declares a queue. The class has these statics:
@@ -122,7 +124,7 @@ The public surface:
     - `layer` creates the queue if it is missing, when the layer builds.
     - `send(payload, options?)` returns `Effect<Option<JobId>, SqlError | PgBossError | SchemaError, Self | ...>`. It is `None` when a singleton or throttle policy drops the job.
     - `step(payload, { dependsOn?, job? })` builds one node of a flow.
-    - `worker(handler, options?)` returns a `Layer`. The handler gets a non-empty batch of `Job<A>`. `transactional` defaults to `true`. `transactionTimeoutSeconds` exists only when `transactional` is `true`.
+    - `worker(handler, options)` returns a `Layer`. The handler gets a non-empty batch of `Job<A>`. `transactional` is required and has no default. `transactionTimeoutSeconds` exists only when `transactional` is `true`.
 - `JobQueue.flow(record)` inserts a graph of jobs and returns `{ [ref]: JobId }`. `dependsOn` accepts only the other keys of the same record.
 - `JobQueue.Job<A>` has `id`, `queue`, `data`, `retryCount` and `expireInSeconds`. `JobQueue.JobId` is a branded string with a `Schema`.
 - `PgBoss.layer(options?)` and `PgBoss.layerConfig(...)` need `PgClient.PgClient`. Options are pg-boss constructor options without the connection fields, plus these:
@@ -133,11 +135,12 @@ The public surface:
 - `PgBoss.use((boss, connection) => Promise<A>)` is the escape hatch for the rest of pg-boss's API. `connection` is `{ db }` inside a transaction and `{}` outside one.
 - `PgBossError` covers pg-boss failures that are not SQL errors. SQL failures surface as the original typed `SqlError`, for example `UniqueViolation`.
 
-These mistakes are compile errors, and `examples/usage.ts` proves each one with a `@ts-expect-error`:
+These mistakes are compile errors, and `packages/effect-sql-pg-boss/test/usage.ts` proves each one with a `@ts-expect-error`:
 
 - a typo in a `dependsOn` ref, and a step that depends on itself;
 - a payload that does not match the schema;
 - `transactionTimeoutSeconds` on a non-transactional worker;
+- a worker that does not state `transactional`, or has no options at all;
 - using a queue whose layer is not provided.
 
 ## How it works inside
@@ -211,8 +214,8 @@ The synthesis is candidate 3's native direction with candidate 1's queue API. It
 
 ## Open decisions for you
 
-1. For a client made with `PgClient.makeClient` (one connection, no pool), should `PgBoss.layer` refuse transactional workers? The headroom check also needs a cast, because `PgClientConfig` has no `maxConnections`. The `PgPool` default is 10 (`PgPool.ts:162`).
-2. Should `transactional` default to `true`, or be required on every `worker` call?
+1. **Decided: transactional workers are not supported on a `PgClient.makeClient` client, and `PgBoss.layer` does not refuse them.** `PgClient.make` and `PgClient.makeClient` both store the raw options as `config` (`PgClient.ts:186`, `:212`), so nothing public tells the two apart. The headroom check reads `config.maxConnections` through one cast and falls back to 10, the `PgPool` default (`PgPool.ts:162`), so the budget is exact for every pooled client. On `makeClient` a transactional batch would pin the only connection for the handler's run (`PgClient.ts:209`) and stall every other query of the app, and the docs say so.
+2. **Decided: `transactional` is required on every `worker` call.** The two modes differ in what they hold (a connection and an open transaction for the whole handler run) and in what commits together, and the right one depends on the handler. pg-boss defaults to `false` (`src/attorney.ts:480`), so a `true` default would silently diverge from it. A required field ties the headroom build failure to a visible choice, at the cost of one field per worker.
 3. Should a payload that fails to decode go to the dead-letter queue instead of being retried?
 4. Should a queue layer also update the options of an existing queue (`updateQueue`)?
 5. Is polling acceptable for v0.1, or should `useListenNotify` go through `PgClient.listen` now?

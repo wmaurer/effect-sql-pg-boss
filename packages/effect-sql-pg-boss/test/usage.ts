@@ -106,17 +106,19 @@ export const ChargeCardWorker = ChargeCard.worker(
             yield* AuditLog.send({ orderId: job.data.orderId, event: "charged" });
         }
     }),
-    { batchSize: 10, localConcurrency: 2 },
+    { transactional: true, batchSize: 10, localConcurrency: 2 },
 );
 
-// The quickstart worker: no options, so it is transactional.
-export const QuickstartWorker = SendWelcomeEmail.worker((jobs) =>
-    Effect.gen(function* () {
-        const sql = yield* SqlClient.SqlClient;
-        for (const job of jobs) {
-            yield* sql`insert into email_outbox ${sql.insert({ userId: job.data.userId, kind: "welcome" })}`;
-        }
-    }),
+// The quickstart worker only writes the database, so it is transactional.
+export const QuickstartWorker = SendWelcomeEmail.worker(
+    (jobs) =>
+        Effect.gen(function* () {
+            const sql = yield* SqlClient.SqlClient;
+            for (const job of jobs) {
+                yield* sql`insert into email_outbox ${sql.insert({ userId: job.data.userId, kind: "welcome" })}`;
+            }
+        }),
+    { transactional: true },
 );
 
 // A non-transactional worker: nothing is held while the handler runs.
@@ -136,7 +138,17 @@ export const WelcomeEmailWorker = SendWelcomeEmail.worker(
 // @ts-expect-error transactionTimeoutSeconds needs a transactional worker
 export const badOptions = SendWelcomeEmail.worker(() => Effect.void, { transactional: false, transactionTimeoutSeconds: 5 });
 
-export const timedOptions = SendWelcomeEmail.worker(() => Effect.void, { transactionTimeoutSeconds: 30 });
+export const timedOptions = SendWelcomeEmail.worker(() => Effect.void, {
+    transactional: true,
+    transactionTimeoutSeconds: 30,
+});
+
+// Every worker states whether it is transactional.
+// @ts-expect-error transactional is required
+export const unstatedOptions = SendWelcomeEmail.worker(() => Effect.void, { batchSize: 5 });
+
+// @ts-expect-error the options argument is required
+export const noOptions = SendWelcomeEmail.worker(() => Effect.void);
 
 // Escape hatch.
 export const stats = PgBoss.use((boss) => boss.getQueueStats(ChargeCard.queueName));
