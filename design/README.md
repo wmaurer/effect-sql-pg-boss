@@ -2,7 +2,7 @@
 
 This document holds everything from the session of 2026-10-20 that designed `@wmaurer/effect-sql-pg-boss`. You can start a new session from this file alone. All supporting files are in this folder, and the paths below are relative to it.
 
-Status: the investigation is finished, and the API sketch is finished and verified. The sketch is ported into `packages/effect-sql-pg-boss/`. The internal modules run there on `effect` 4.0.5, under an integration suite. The public modules still have TODO bodies.
+Status: the investigation is finished, and the API sketch is finished and verified. The sketch is ported into `packages/effect-sql-pg-boss/`. `PgBoss.layer`, `PgBoss.layerConfig` and `PgBoss.use` are implemented. The integration suite runs on `effect` 4.0.5 and builds everything through `PgBoss.layer`. `JobQueue` still has TODO bodies.
 
 ## Contents of the folder
 
@@ -272,6 +272,6 @@ To typecheck a sketch, run `tsc -p tsconfig.json --noEmit` in its directory. Typ
 
 ## Next step
 
-Steps 1 to 3 are done. `packages/effect-sql-pg-boss/` has the dependencies, the ported `src/`, and `test/usage.ts` with the type-level assertions. Its integration suite runs P1, P2, P2b, P5 and the headroom check against Postgres 18 (`pnpm test`).
+Steps 1 to 4 are done. `packages/effect-sql-pg-boss/` has the dependencies, the ported `src/`, `PgBoss.layer`, and `test/usage.ts` with the type-level assertions. Its integration suite runs P1, P2, P2b, P5 and the headroom check through `PgBoss.layer` against Postgres 18 (`pnpm test`). The tests register transactional work with `boss.work` and `WorkerTransaction.workCallback`, as `JobQueue.worker` will.
 
-Next, implement `PgBoss.layer` by moving the wiring from `test/fixture.ts` into it. That file assembles the same pieces as `prototype/synth.ts`. Then implement `JobQueue.Service` and `JobQueue.flow`, and run the suite again through `ChargeCard.worker` and `ChargeCard.send` instead of the internal helpers.
+Next, implement `JobQueue.Service` and `JobQueue.flow`, and run the suite again through `ChargeCard.worker` and `ChargeCard.send` instead of the internal helpers.

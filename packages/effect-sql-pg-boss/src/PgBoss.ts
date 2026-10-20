@@ -1,10 +1,17 @@
+import * as PgClient from "@effect/sql-pg/PgClient";
 import * as Config from "effect/Config";
 import * as Context from "effect/Context";
 import * as Effect from "effect/Effect";
+import * as FiberSet from "effect/FiberSet";
 import * as Layer from "effect/Layer";
 import * as Schema from "effect/Schema";
+import * as Boss from "pg-boss";
 
-import type { Runtime, RuntimeId } from "./internal/runtime.ts";
+import * as Connection from "./internal/connection.ts";
+import * as Housekeeping from "./internal/housekeeping.ts";
+import { connectionBudget, type Runtime, RuntimeId } from "./internal/runtime.ts";
+import * as WorkerTransaction from "./internal/workerTransaction.ts";
+
 /**
  * The running pg-boss instance, as a scoped layer over the app's native
  * `PgClient`.
@@ -15,10 +22,8 @@ import type { Runtime, RuntimeId } from "./internal/runtime.ts";
  *
  * @since 0.1.0
  */
-import type { PgClient } from "@effect/sql-pg/PgClient";
 import type * as Duration from "effect/Duration";
 import type { SqlError } from "effect/sql/SqlError";
-import type * as Boss from "pg-boss";
 
 /**
  * A pg-boss call failed for a reason other than SQL: argument validation, a
@@ -118,6 +123,10 @@ export const use = <A>(
  * `PgClient.layer` provides both from one instance; transactional workers
  * find their transaction through it.
  *
+ * Transactional workers may hold the PgClient pool's `maxConnections`
+ * (10 when unset) minus `connectionReserve`. They are not supported on a
+ * `PgClient.makeClient` client, where a batch would pin the only connection.
+ *
  * Finalizers run in reverse: `boss.stop()` (graceful, `close: false`), then
  * the worker transactions still open are interrupted and roll back, then the
  * maintenance connections close.
@@ -125,28 +134,45 @@ export const use = <A>(
  * @since 0.1.0
  * @category layers
  */
-export const layer = (_options?: Options): Layer.Layer<PgBoss, PgBossError | SqlError, PgClient> =>
-    // TODO, every step below runs for real in prototype/synth.ts:
-    // const sql = yield* PgClient
-    // const housekeeping = yield* Housekeeping.make(sql.config, options.maintenanceConnections ?? 4)
-    // const fork = yield* FiberSet.makeRuntime<never>()
-    // const base = yield* Effect.context<never>()
-    // const db: Db = {
-    //   executeSql: housekeeping.executeSql,
-    //   beginTransaction: () => WorkerTransaction.begin({ sql, fork, base, rollbackTimeout: options.rollbackTimeout ?? "5 seconds" })
-    // }
-    // const boss = new Boss.PgBoss({ ...bossOptions, db })
-    // boss.on("error", (e) => fork(Effect.logError("pg-boss", e)))
-    // boss.on("warning", (w) => fork(Effect.logWarning("pg-boss", w.message, w.data)))
-    // yield* Effect.acquireRelease(
-    //   Connection.call("start", () => boss.start()),
-    //   () => Effect.promise(() => boss.stop({ graceful: true, timeout: 30_000, ...options.stop, close: false })))
-    // const reserveConnections = connectionBudget(((sql.config as PgPoolConfig).maxConnections ?? 10) - (options.connectionReserve ?? 2))
-    // return PgBoss.of({
-    //   use: (f) => Effect.flatMap(Connection.currentDb(sql), (db) => Connection.call("use", () => f(boss, db === undefined ? {} : { db }))),
-    //   [RuntimeId]: { boss, sql, reserveConnections }
-    // })
-    Layer.effect(PgBoss, Effect.die(new Error("not implemented")));
+export const layer = (options: Options = {}): Layer.Layer<PgBoss, PgBossError | SqlError, PgClient.PgClient> =>
+    Layer.effect(
+        PgBoss,
+        Effect.gen(function* () {
+            const { maintenanceConnections, connectionReserve, rollbackTimeout, stop, ...bossOptions } = options;
+            const sql = yield* PgClient.PgClient;
+            const housekeeping = yield* Housekeeping.make(sql.config, maintenanceConnections ?? 4);
+            const fork = yield* FiberSet.makeRuntime<never>();
+            const base = yield* Effect.context<never>();
+            const boss = new Boss.PgBoss({
+                ...bossOptions,
+                db: {
+                    executeSql: housekeeping.executeSql,
+                    beginTransaction: () =>
+                        WorkerTransaction.begin({ sql, fork, base, rollbackTimeout: rollbackTimeout ?? "5 seconds" }),
+                },
+            });
+            boss.on("error", (error) => fork(Effect.logError("pg-boss", error)));
+            boss.on("warning", (warning) => fork(Effect.logWarning("pg-boss", warning.message, warning.data)));
+            yield* Effect.acquireRelease(
+                Connection.call("start", () => boss.start()),
+                () => Effect.promise(() => boss.stop({ graceful: true, timeout: 30_000, ...stop, close: false })),
+            );
+            // SAFETY: `PgClient.make` stores its `PgPoolConfig` as `config`. A `makeClient` config has
+            // no `maxConnections` and gets the pool default; transactional workers are unsupported there.
+            const maxConnections = (sql.config as PgClient.PgPoolConfig).maxConnections ?? 10;
+            return PgBoss.of({
+                use: (f) =>
+                    Effect.flatMap(Connection.currentDb(sql), (db) =>
+                        Connection.call("use", () => f(boss, db === undefined ? {} : { db })),
+                    ),
+                [RuntimeId]: {
+                    boss,
+                    sql,
+                    reserveConnections: connectionBudget(maxConnections - (connectionReserve ?? 2)),
+                },
+            });
+        }),
+    );
 
 /**
  * {@link layer} with options read from `Config`.
@@ -156,5 +182,5 @@ export const layer = (_options?: Options): Layer.Layer<PgBoss, PgBossError | Sql
  */
 export const layerConfig = (
     options: Config.Wrap<Options>,
-): Layer.Layer<PgBoss, Config.ConfigError | PgBossError | SqlError, PgClient> =>
+): Layer.Layer<PgBoss, Config.ConfigError | PgBossError | SqlError, PgClient.PgClient> =>
     Layer.unwrap(Effect.map(Config.unwrap(options), layer));

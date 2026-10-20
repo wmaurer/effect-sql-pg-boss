@@ -47,9 +47,10 @@ export const make = (
             Effect.sync(() => new pg.Pool(poolConfig(config, maxConnections))),
             (pool) => Effect.promise(() => pool.end()),
         );
-        // node-postgres calls this outside any fiber. It logs with the default logger until PgBoss.layer passes its context.
-        // @effect-diagnostics-next-line runEffectInsideEffect:off
-        const logError = (error: Error) => Effect.runFork(Effect.logWarning("pg-boss maintenance connection", error));
+        // node-postgres calls this outside any fiber; the layer's context carries the app's logger.
+        const context = yield* Effect.context<never>();
+        const logError = (error: Error) =>
+            Effect.runForkWith(context)(Effect.logWarning("pg-boss maintenance connection", error));
         pool.on("error", logError);
         pool.on("connect", (client) => client.on("error", logError));
         return {

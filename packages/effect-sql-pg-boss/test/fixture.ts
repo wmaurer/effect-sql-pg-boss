@@ -1,33 +1,18 @@
 /**
- * The wiring `PgBoss.layer` will own, assembled from the internal modules the
- * way the design prototype ran them: the maintenance pool, a FiberSet runtime,
- * and `WorkerTransaction.begin` as pg-boss's `beginTransaction`, around a real
- * pg-boss over a database of the test file's own.
+ * `PgBoss.layer` over a `PgClient` on a database of the test file's own.
+ * Tests reach pg-boss and the internals only through the layer's runtime.
  */
 import { PgClient } from "@effect/sql-pg";
-import {
-    Array as Arr,
-    Clock,
-    Context,
-    Duration,
-    Effect,
-    FiberSet,
-    Layer,
-    Option,
-    Record,
-    Redacted,
-    Ref,
-    Schedule,
-    Schema,
-} from "effect";
-import { PgBoss } from "pg-boss";
+import { Array as Arr, Clock, Context, Effect, Layer, Option, Record, Redacted, Ref, Schedule, Schema } from "effect";
 import { inject } from "vitest";
 
+import { PgBoss } from "../src/index.ts";
 import * as Connection from "../src/internal/connection.ts";
-import * as Housekeeping from "../src/internal/housekeeping.ts";
+import { RuntimeId } from "../src/internal/runtime.ts";
 import * as WorkerTransaction from "../src/internal/workerTransaction.ts";
 import { docker } from "./docker.ts";
 
+import type { Duration } from "effect";
 import type * as Boss from "pg-boss";
 
 /** What every test job carries. `tag` names the job's rows in `app` and in `pgboss.job`. */
@@ -37,23 +22,13 @@ export type JobData = typeof JobData.Type;
 /** A pg-boss job id. */
 export const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 
-/** One `commit()` or `rollback()` pg-boss made on a worker transaction, in epoch milliseconds. */
-export interface Settle {
-    readonly db: Connection.Db;
-    readonly kind: "commit" | "rollback";
-    readonly calledAt: number;
-    readonly resolvedAt: number;
-}
-
 export class Harness extends Context.Service<
     Harness,
     {
         readonly sql: PgClient.PgClient;
-        readonly boss: PgBoss;
-        readonly housekeeping: Housekeeping.Housekeeping;
+        readonly boss: Boss.PgBoss;
         /** The `tx` pg-boss handed each batch, by the tag of the batch's first job. */
         readonly transactions: Ref.Ref<Record<string, Connection.Db>>;
-        readonly settles: Ref.Ref<ReadonlyArray<Settle>>;
         /** What the server logged for one backend, when this run started the server. */
         readonly serverLog: Option.Option<(pid: number) => Effect.Effect<ReadonlyArray<string>>>;
     }
@@ -78,15 +53,19 @@ const database = (name: string) =>
         }),
     ).pipe(Layer.provide(PgClient.layer({ url: Redacted.make(inject("databaseUrl")) })));
 
-const appClient = (name: string) => {
+/** The URL of the test file's database. */
+export const databaseUrl = (name: string) => {
     const url = new URL(inject("databaseUrl"));
     url.pathname = `/${name}`;
-    return PgClient.layer({
-        url: Redacted.make(url.toString()),
+    return Redacted.make(url.toString());
+};
+
+const appClient = (name: string) =>
+    PgClient.layer({
+        url: databaseUrl(name),
         maxConnections: 6,
         transformResultNames: (column) => column.replace(/_(\w)/g, (_, letter: string) => letter.toUpperCase()),
     });
-};
 
 const serverLog = (container: string) => (pid: number) =>
     Effect.map(docker("logs", container), (logs) =>
@@ -98,40 +77,7 @@ const harness = (options: Options) =>
         Harness,
         Effect.gen(function* () {
             const sql = yield* PgClient.PgClient;
-            const housekeeping = yield* Housekeeping.make(sql.config, 3);
-            const fork = yield* FiberSet.makeRuntime<never>();
-            const runPromise = yield* FiberSet.makeRuntimePromise<never>();
-            const base = yield* Effect.context<never>();
-            const rollbackTimeout = options.rollbackTimeout ?? "5 seconds";
-            const settles = yield* Ref.make<ReadonlyArray<Settle>>([]);
-
-            const settle = (db: Connection.Db, kind: Settle["kind"], run: () => Promise<void>) =>
-                runPromise(
-                    Effect.gen(function* () {
-                        const calledAt = yield* Clock.currentTimeMillis;
-                        yield* Effect.promise(run);
-                        const resolvedAt = yield* Clock.currentTimeMillis;
-                        yield* Ref.update(settles, Arr.append({ db, kind, calledAt, resolvedAt }));
-                    }),
-                );
-
-            const boss = new PgBoss({
-                schema: "pgboss",
-                db: {
-                    executeSql: housekeeping.executeSql,
-                    beginTransaction: () =>
-                        WorkerTransaction.begin({ sql, fork, base, rollbackTimeout }).then((handle) => ({
-                            db: handle.db,
-                            commit: () => settle(handle.db, "commit", () => handle.commit()),
-                            rollback: () => settle(handle.db, "rollback", () => handle.rollback()),
-                        })),
-                },
-            });
-            boss.on("error", (error) => fork(Effect.logWarning("pg-boss", error)));
-            yield* Effect.acquireRelease(
-                Connection.call("start", () => boss.start()),
-                () => Effect.promise(() => boss.stop({ graceful: true, timeout: 5000, close: false })),
-            );
+            const { boss } = (yield* PgBoss.PgBoss)[RuntimeId];
             for (const [name, queue] of options.queues) {
                 yield* Connection.call("createQueue", () => boss.createQueue(name, queue));
             }
@@ -141,17 +87,26 @@ const harness = (options: Options) =>
             return Harness.of({
                 sql,
                 boss,
-                housekeeping,
                 transactions: yield* Ref.make<Record<string, Connection.Db>>({}),
-                settles,
                 serverLog: container === undefined ? Option.none() : Option.some(serverLog(container)),
             });
         }),
     );
 
-/** A pg-boss started on the app's `PgClient`, over a fresh database. Its scope stops pg-boss. */
+/** `PgBoss.layer` started on the app's `PgClient`, over a fresh database. Its scope stops pg-boss. */
 export const layer = (options: Options) =>
-    harness(options).pipe(Layer.provideMerge(appClient(options.database)), Layer.provide(database(options.database)));
+    harness(options).pipe(
+        Layer.provideMerge(
+            PgBoss.layer({
+                schema: "pgboss",
+                maintenanceConnections: 3,
+                rollbackTimeout: options.rollbackTimeout,
+                stop: { timeout: 5000 },
+            }),
+        ),
+        Layer.provideMerge(appClient(options.database)),
+        Layer.provide(database(options.database)),
+    );
 
 /**
  * Works `queue` with a transactional worker, as `JobQueue.worker` will: the
@@ -194,22 +149,6 @@ export const transactionOf = (tag: string) =>
         return Record.get(yield* Ref.get(transactions), tag);
     });
 
-/** Polls until pg-boss's settle of the batch with this tag has resolved, and returns its settles. */
-export const settled = (tag: string) =>
-    Effect.gen(function* () {
-        const { settles } = yield* Harness;
-        const tx = yield* transactionOf(tag);
-        return yield* Effect.map(Ref.get(settles), (all) =>
-            Arr.filter(all, (settle) => Option.contains(tx, settle.db)),
-        ).pipe(
-            Effect.repeat({ schedule: Schedule.spaced("50 millis"), until: (mine) => mine.length > 0 }),
-            Effect.timeoutOrElse({
-                duration: "5 seconds",
-                orElse: () => Effect.die(new Error(`timed out waiting for the settle of ${tag}`)),
-            }),
-        );
-    });
-
 /** Sends a job on the fiber's transaction, as `Queue.send` will. */
 export const send = (queue: string, data: JobData) =>
     Effect.gen(function* () {
@@ -224,15 +163,34 @@ export const sendOutside = (queue: string, data: JobData) =>
         return yield* Connection.call("send", () => boss.send(queue, data));
     });
 
+/** Runs a statement on pg-boss's maintenance connections, apart from the app's pool. */
+export const maintenanceQuery = (text: string, values: ReadonlyArray<unknown>) =>
+    Effect.gen(function* () {
+        const { boss } = yield* Harness;
+        const result = yield* Effect.promise(() => boss.getDb().executeSql(text, [...values]));
+        return result.rows;
+    });
+
 /** `name:state` for each job with this tag, read on the maintenance pool. */
 export const jobStates = (tag: string) =>
-    Effect.gen(function* () {
-        const { housekeeping } = yield* Harness;
-        const result = yield* Effect.promise(() =>
-            housekeeping.executeSql("select name, state from pgboss.job where data->>'tag' = $1 order by name", [tag]),
-        );
-        return Arr.map(result.rows, (row) => `${row.name}:${row.state}`);
-    });
+    Effect.map(
+        maintenanceQuery("select name, state from pgboss.job where data->>'tag' = $1 order by name", [tag]),
+        Arr.map((row) => `${row.name}:${row.state}`),
+    );
+
+/**
+ * The error pg-boss stored on the job `name` with this tag, and when it
+ * failed the job, in epoch milliseconds. pg-boss fails a transactional batch
+ * only after its `rollback()` resolved.
+ */
+export const failure = (tag: string, name: string) =>
+    Effect.map(
+        maintenanceQuery(
+            "select output, (extract(epoch from completed_on) * 1000)::float8 as failed_at from pgboss.job where name = $1 and data->>'tag' = $2 and state = 'failed'",
+            [name, tag],
+        ),
+        (rows) => ({ output: rows[0]?.output, failedAt: Number(rows[0]?.failed_at) }),
+    );
 
 /** The notes of the app rows with this tag, read through the app's `PgClient`. */
 export const appNotes = (tag: string) =>

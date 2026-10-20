@@ -4,12 +4,13 @@ import { Array as Arr, Deferred, Effect, Option, Record, Ref } from "effect";
 import * as Connection from "../src/internal/connection.ts";
 import {
     appNotes,
+    failure,
     Harness,
     jobStates,
     layer as harness,
+    maintenanceQuery,
     send,
     sendOutside,
-    settled,
     timeline,
     transactionOf,
     UUID,
@@ -41,6 +42,17 @@ const workerTransaction = (lines: ReadonlyArray<string>) => {
     return Arr.take(Arr.drop(lines, beginAt), rollbackAt + 1 - beginAt);
 };
 
+/** How the transaction that first bound `tag` as a parameter ended: `COMMIT` or `ROLLBACK`. */
+const transactionEnd = (lines: ReadonlyArray<string>, tag: string) =>
+    Option.flatMap(
+        Arr.findFirstIndex(lines, (line) => line.includes("Parameters:") && line.includes(`'${tag}'`)),
+        (boundAt) =>
+            Option.map(
+                Arr.findFirst(lines, (line, index) => index > boundAt && /: (COMMIT|ROLLBACK)$/.test(line)),
+                (line) => line.replace(/^.*: /, ""),
+            ),
+    );
+
 layer(
     harness({
         database: "worker_transaction",
@@ -54,10 +66,14 @@ layer(
 )("the parked worker transaction", (it) => {
     it.effect("P1: the handler's writes, savepoints and sends commit with the job, or roll back with it", () =>
         Effect.gen(function* () {
-            const { sql, housekeeping } = yield* Harness;
-            const seen = yield* Ref.make<Record<string, { readonly sameTx: boolean; readonly followId: string }>>({});
+            const { sql, serverLog } = yield* Harness;
+            const handler = yield* timeline;
+            const seen = yield* Ref.make<
+                Record<string, { readonly sameTx: boolean; readonly followId: string; readonly pid: number }>
+            >({});
             yield* work("p1", (job) =>
                 Effect.gen(function* () {
+                    const [row] = yield* sql<{ readonly pid: number }>`select pg_backend_pid() as pid`;
                     yield* sql`insert into app ${sql.insert({ tag: job.tag, note: "outer" })}`;
                     yield* sql.withTransaction(
                         sql`insert into app ${sql.insert({ tag: job.tag, note: "nested-savepoint" })}`,
@@ -78,9 +94,13 @@ layer(
                         Record.set(job.tag, {
                             sameTx: Option.contains(pgBossTx, handlerDb),
                             followId: String(followId),
+                            pid: row?.pid ?? 0,
                         }),
                     );
-                    if (job.fail === true) return yield* Effect.die(new Error("handler failed on purpose"));
+                    if (job.fail === true) {
+                        yield* handler.mark("failing");
+                        return yield* Effect.die(new Error("handler failed on purpose"));
+                    }
                 }),
             );
             yield* sendOutside("p1", { tag: "p1-ok", fail: false });
@@ -107,21 +127,26 @@ layer(
                 );
             }
 
-            assert.deepStrictEqual(
-                Arr.map(yield* settled("p1-ok"), (settle) => settle.kind),
-                ["commit"],
+            const failed = yield* failure("p1-bad", "p1");
+            assert.isBelow(
+                failed.failedAt - (yield* handler.at("failing")),
+                2500,
+                "rollback() did not wait for its timeout: pg-boss fails the job once it resolves",
             );
-            const rollbacks = yield* settled("p1-bad");
-            assert.deepStrictEqual(
-                Arr.map(rollbacks, (settle) => settle.kind),
-                ["rollback"],
-            );
-            for (const rollback of rollbacks) {
-                assert.isBelow(
-                    rollback.resolvedAt - rollback.calledAt,
-                    2500,
-                    "rollback() did not wait for its timeout",
-                );
+            assert.strictEqual(String(failed.output?.message).split("\n")[0], "Error: handler failed on purpose");
+
+            if (Option.isSome(serverLog)) {
+                for (const [tag, end] of [
+                    ["p1-ok", "COMMIT"],
+                    ["p1-bad", "ROLLBACK"],
+                ] as const) {
+                    const lines = yield* serverLog.value(observed[tag]?.pid ?? 0);
+                    assert.deepStrictEqual(
+                        transactionEnd(lines, tag),
+                        Option.some(end),
+                        `${tag}: pg-boss settled with ${end}`,
+                    );
+                }
             }
 
             const settledTx = yield* transactionOf("p1-ok");
@@ -134,23 +159,12 @@ layer(
                 ),
             );
             assert.strictEqual(afterSettle, "rejected: pg-boss used a worker transaction after it was settled");
-
-            const stored = yield* Effect.promise(() =>
-                housekeeping.executeSql(
-                    "select output from pgboss.job where name = 'p1' and data->>'tag' = 'p1-bad'",
-                    [],
-                ),
-            );
-            assert.strictEqual(
-                String(stored.rows[0]?.output?.message).split("\n")[0],
-                "Error: handler failed on purpose",
-            );
         }),
     );
 
     it.effect("P2: an abandoned handler is interrupted before ROLLBACK, and its connection goes back to the pool", () =>
         Effect.gen(function* () {
-            const { sql, housekeeping, serverLog } = yield* Harness;
+            const { sql, serverLog } = yield* Harness;
             const handler = yield* timeline;
             const backend = yield* Deferred.make<number>();
             yield* work("p2", (job) =>
@@ -169,31 +183,21 @@ layer(
             const pid = yield* Deferred.await(backend);
             const startedAt = yield* handler.at("started");
             const interruptedAt = yield* handler.at("interrupted");
-            const rollbacks = yield* settled("p2-abandon");
-            assert.deepStrictEqual(
-                Arr.map(rollbacks, (settle) => settle.kind),
-                ["rollback"],
-            );
-            for (const rollback of rollbacks) {
-                assert.isAtLeast(rollback.calledAt - startedAt, 1000, "pg-boss gave up on expiry, not at once");
-                assert.isBelow(rollback.calledAt - startedAt, 9000, "while the handler was still in pg_sleep(10)");
-                assert.isAtLeast(interruptedAt, rollback.calledAt, "interrupted after pg-boss called rollback()");
-                assert.isAtMost(interruptedAt, rollback.resolvedAt, "interrupted before rollback() resolved");
-                assert.isBelow(
-                    rollback.resolvedAt - rollback.calledAt,
-                    2500,
-                    "rollback() did not wait for its timeout",
-                );
-            }
+            const failed = yield* failure("p2-abandon", "p2");
+            assert.strictEqual(failed.output?.message, "handler execution exceeded 2s", "pg-boss gave up on expiry");
+            assert.isAtLeast(interruptedAt - startedAt, 1000, "pg-boss gave up on expiry, not at once");
+            assert.isBelow(interruptedAt - startedAt, 9000, "while the handler was still in pg_sleep(10)");
+            assert.isAtMost(interruptedAt, failed.failedAt, "interrupted before rollback() resolved");
+            assert.isBelow(failed.failedAt - interruptedAt, 2500, "rollback() did not wait for its timeout");
             assert.isFalse(yield* handler.reached("finished"));
 
             assert.deepStrictEqual(yield* appNotes("p2-abandon"), []);
             assert.deepStrictEqual(yield* jobStates("p2-abandon"), ["p2:failed"]);
 
-            const activity = yield* Effect.promise(() =>
-                housekeeping.executeSql("select pid, state from pg_stat_activity where pid = $1", [pid]),
+            assert.deepStrictEqual(
+                yield* maintenanceQuery("select pid, state from pg_stat_activity where pid = $1", [pid]),
+                [{ pid, state: "idle" }],
             );
-            assert.deepStrictEqual(activity.rows, [{ pid, state: "idle" }]);
             const held = yield* Effect.all(
                 Arr.makeBy(6, () =>
                     sql.withTransaction(sql<{ readonly pid: number }>`select pg_backend_pid() as pid, pg_sleep(0.2)`),
@@ -251,18 +255,17 @@ layer(
             assert.isFalse(yield* handler.reached("interrupted"), "the job failed while the handler still slept");
             assert.deepStrictEqual(yield* jobStates("p2b-wedged"), ["p2b:failed"]);
 
-            const rollbacks = yield* settled("p2b-wedged");
-            assert.deepStrictEqual(
-                Arr.map(rollbacks, (settle) => settle.kind),
-                ["rollback"],
+            const startedAt = yield* handler.at("started");
+            const failed = yield* failure("p2b-wedged", "p2b");
+            assert.strictEqual(failed.output?.message, "handler execution exceeded 1s", "pg-boss gave up on expiry");
+            assert.isAtLeast(
+                failed.failedAt - startedAt,
+                1900,
+                "rollback() waited for rollbackTimeout (1 s) after the expiry (1 s) before pg-boss failed the job",
             );
-            for (const rollback of rollbacks) {
-                assert.isAtLeast(rollback.resolvedAt - rollback.calledAt, 950, "rollback() waited for rollbackTimeout");
-                assert.isBelow(rollback.resolvedAt - rollback.calledAt, 2500, "and no longer");
-            }
+            assert.isBelow(failed.failedAt - startedAt, 3000, "and no longer");
 
             yield* Effect.sleep("4 seconds");
-            const startedAt = yield* handler.at("started");
             const interruptedAt = yield* handler.at("interrupted");
             assert.isAtLeast(interruptedAt - startedAt, 3500, "interrupted once it left the uninterruptible sleep");
             assert.isFalse(yield* handler.reached("woke up"));
