@@ -174,7 +174,16 @@ These mistakes are compile errors, and `packages/effect-sql-pg-boss/test/usage.t
 | P5. Raw rows and errors | With camelCase `transformResultNames`, pg-boss got `created_on`. `send` and `flow` inside a transaction committed and rolled back with it. A unique violation reached pg-boss as `code=23505` and the Effect as `SqlError/UniqueViolation`. |
 | Headroom                | Reserving past the budget failed at layer build with a clear message.                                                                                                                                                                       |
 
-Not run yet: `commit()` when the COMMIT itself fails, a failing BEGIN, shutdown while a handler waits to start, and abandonment through `boss.stop()`. P2 used job expiry, which takes the same rollback path.
+`test/layer.test.ts` in the package runs the paths the prototype did not:
+
+- `PgBoss.use` gets `{}` outside a transaction and the transaction's `db` inside one. A `send` through it commits and rolls back with the app's rows.
+- The headroom budget comes from config. `maxConnections: 5` with `connectionReserve: 2` gives 3, and an unset pool with the default reserve gives 8.
+- A COMMIT that fails on a deferred unique constraint rolls back the handler's rows. The job ends `failed`, and its stored error carries `code: "23505"`.
+- Closing the layer while a transactional handler sleeps takes the stop timeout and little more (2 s configured). The handler is interrupted, its row rolls back, the job ends `failed` with `pg-boss shut down while active`, and no connection of either pool remains.
+- A worker transaction that cannot start fails the job without running the handler. The test forces it with a `PgClient` whose startup parameters the server rejects (`22023`), so the failure is at connect, not at the `BEGIN` statement.
+- An error on a maintenance connection reaches the app's logger.
+
+Not run yet: shutdown while a handler waits to start.
 
 ## Versions
 
