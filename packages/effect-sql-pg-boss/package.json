@@ -1,0 +1,32 @@
+{
+    "name": "@wmaurer/effect-sql-pg-boss",
+    "version": "0.0.0",
+    "files": [
+        "dist",
+        "src"
+    ],
+    "type": "module",
+    "exports": {
+        ".": "./src/index.ts"
+    },
+    "publishConfig": {
+        "exports": {
+            ".": {
+                "types": "./dist/index.d.ts",
+                "default": "./dist/index.js"
+            }
+        },
+        "access": "public"
+    },
+    "scripts": {
+        "build": "tsc -b",
+        "test": "vitest run --passWithNoTests"
+    },
+    "devDependencies": {
+        "effect": "4.0.5",
+        "vitest": "^5.0.5"
+    },
+    "peerDependencies": {
+        "effect": "^4.0.5"
+    }
+}
