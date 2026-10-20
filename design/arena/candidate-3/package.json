@@ -1,0 +1,16 @@
+{
+    "name": "@wmaurer/effect-sql-pg-boss",
+    "private": true,
+    "type": "module",
+    "exports": {
+        ".": "./src/index.ts"
+    },
+    "dependencies": {
+        "pg": "^8.23.1"
+    },
+    "peerDependencies": {
+        "@effect/sql-pg": "^4.0.5",
+        "effect": "^4.0.5",
+        "pg-boss": "~12.38.0"
+    }
+}

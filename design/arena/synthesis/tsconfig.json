@@ -1,0 +1,23 @@
+{
+    "include": ["src", "examples", "prototype", "types/pg"],
+    "compilerOptions": {
+        "target": "ES2022",
+        "module": "NodeNext",
+        "moduleResolution": "NodeNext",
+        "moduleDetection": "force",
+        "verbatimModuleSyntax": true,
+        "allowImportingTsExtensions": true,
+        "erasableSyntaxOnly": true,
+        "noEmit": true,
+        "strict": true,
+        "exactOptionalPropertyTypes": true,
+        "noImplicitOverride": true,
+        "noUnusedLocals": true,
+        "noUnusedParameters": true,
+        "skipLibCheck": true,
+        "noErrorTruncation": true,
+        "lib": ["ES2024", "DOM"],
+        "types": ["node"],
+        "typeRoots": ["/home/wayne/projects/effect-ts/effect/node_modules/@types"]
+    }
+}

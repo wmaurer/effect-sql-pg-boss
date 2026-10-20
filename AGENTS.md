@@ -10,6 +10,8 @@ Instructions for coding agents working in this repository.
 
 - `packages/effect-sql-pg-boss`: the library, published as `@wmaurer/effect-sql-pg-boss`. It exports its TypeScript source from `src/index.ts` inside the workspace and builds to `dist/` for publishing. `effect` is a peer dependency.
 
+`design/` is the design record: the problem, the investigation, three competing API sketches, and the chosen one in `design/arena/synthesis/`. Start from `design/README.md`. The sketches and prototypes import packages the workspace does not install, so lint and typecheck skip `design/`; read it, but put new code in the package.
+
 ## Effect Source and Docs (`node_modules/`)
 
 Effect is the exception to the usual rule of not reading `node_modules/`. Every Effect package ships its TypeScript source in `src/` next to the build output, so the installed copy is the source at exactly the version in the lockfile. Do not clone Effect into `.repos/deps/`, and do not read it on GitHub, where `main` shows APIs this lockfile does not have.

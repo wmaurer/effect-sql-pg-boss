@@ -196,5 +196,8 @@ export default defineConfig({
         // repos
         "scripts/repos.js",
         ".repos",
+        // design. Sketches and prototypes kept as the design record; they import packages
+        // the workspace does not install.
+        "design",
     ],
 });

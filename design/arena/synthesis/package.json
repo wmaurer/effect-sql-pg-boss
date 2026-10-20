@@ -1,0 +1,20 @@
+{
+    "name": "@wmaurer/effect-sql-pg-boss",
+    "version": "0.0.0",
+    "private": true,
+    "type": "module",
+    "exports": {
+        ".": "./src/index.ts",
+        "./JobQueue": "./src/JobQueue.ts",
+        "./PgBoss": "./src/PgBoss.ts",
+        "./internal/*": null
+    },
+    "dependencies": {
+        "pg": "^8.23.1"
+    },
+    "peerDependencies": {
+        "@effect/sql-pg": "^4.0.5",
+        "effect": "^4.0.5",
+        "pg-boss": "~12.38.0"
+    }
+}
