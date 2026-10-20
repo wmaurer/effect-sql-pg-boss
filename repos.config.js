@@ -101,7 +101,6 @@ export default {
             url: "https://github.com/timgit/pg-boss.git",
             probe: { kind: "npm", pkg: "pg-boss" },
             tag: "{v}",
-            seed: "12.38.0",
         },
     ],
 };

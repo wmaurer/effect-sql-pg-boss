@@ -8,7 +8,7 @@ Instructions for coding agents working in this repository.
 
 `effect-sql-pg-boss` brings pg-boss, the Postgres job queue for Node, to Effect. It is a pnpm workspace with one package:
 
-- `packages/effect-sql-pg-boss`: the library, published as `@wmaurer/effect-sql-pg-boss`. It exports its TypeScript source from `src/index.ts` inside the workspace and builds to `dist/` for publishing. `effect` is a peer dependency.
+- `packages/effect-sql-pg-boss`: the library, published as `@wmaurer/effect-sql-pg-boss`. It exports its TypeScript source from `src/index.ts` inside the workspace and builds to `dist/` for publishing. `effect`, `@effect/sql-pg` and `pg-boss` are peer dependencies.
 
 `design/` is the design record: the problem, the investigation, three competing API sketches, and the chosen one in `design/arena/synthesis/`. Start from `design/README.md`. The sketches and prototypes import packages the workspace does not install, so lint and typecheck skip `design/`; read it, but put new code in the package.
 
@@ -34,7 +34,7 @@ Current refs: none.
 
 Current deps:
 
-- `pg-boss`: the Postgres job queue this library wraps. Read it for the queue's schema, its SQL, and the API to mirror. Its npm package ships only `dist/`, so this clone is the source. It is pinned by `seed` until pg-boss is installed in the workspace; once it is, the probe answers instead and the seed can go.
+- `pg-boss`: the Postgres job queue this library wraps. Read it for the queue's schema, its SQL, and the API to mirror. Its npm package ships only `dist/`, so this clone is the source. The npm probe reads the installed version, so the clone follows the lockfile.
 
 `.repos/` is hidden and gitignored, so name it when you search: `rg --hidden --no-ignore 'something' .repos/refs/<name>`.
 
