@@ -1,0 +1,41 @@
+{
+    "name": "effect-sql-pg-boss",
+    "version": "0.0.0",
+    "private": true,
+    "type": "module",
+    "scripts": {
+        "prepare": "node scripts/patch-tsgo.js && simple-git-hooks",
+        "typecheck": "node scripts/typecheck.js",
+        "test": "pnpm -r test",
+        "pre-push": "pnpm fmt:check && pnpm lint && pnpm typecheck && pnpm test",
+        "lint": "oxlint --no-error-on-unmatched-pattern --max-warnings=0 && node scripts/lint-types.js",
+        "lint:backlog": "oxlint --no-error-on-unmatched-pattern",
+        "lint:sync": "node scripts/lint-sync.js",
+        "fmt": "oxfmt .",
+        "fmt:check": "oxfmt --check .",
+        "deps:fetch": "node scripts/repos.js deps fetch",
+        "deps:check": "node scripts/repos.js deps check",
+        "refs:fetch": "node scripts/repos.js refs fetch",
+        "lint:types": "node scripts/lint-types.js"
+    },
+    "devDependencies": {
+        "@effect/tsgo": "0.53.4",
+        "@oxlint/plugins": "1.88.0",
+        "@types/node": "^26.6.5",
+        "@typescript/typescript6": "6.0.2",
+        "oxfmt": "^0.73.0",
+        "oxlint": "1.88.0",
+        "oxlint-tsgolint": "7.0.2004",
+        "simple-git-hooks": "^2.14.0",
+        "tsx": "^4.23.15",
+        "typescript": "^7.0.2"
+    },
+    "simple-git-hooks": {
+        "commit-msg": "if grep -q '^Co-Authored-By.*[Cc]laude' \"$1\"; then printf '\\n❌ Commit message contains a Claude Co-Authored-By line. Remove it and try again.\\n' && exit 1; fi",
+        "pre-push": "unset $(git rev-parse --local-env-vars); exec pnpm pre-push"
+    },
+    "engines": {
+        "node": ">=22.18"
+    },
+    "packageManager": "pnpm@10.33.0"
+}

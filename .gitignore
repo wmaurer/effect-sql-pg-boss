@@ -1,0 +1,18 @@
+# Visual companion working dir (brainstorming mockups)
+.superpowers/
+
+# workspace: dependencies / build output
+node_modules/
+dist/
+*.tsbuildinfo
+
+# repos: upstream source cloned by scripts/repos.js
+.repos
+
+# Session transcript (large one-shot conversation log; kept on disk, not tracked)
+.session/
+
+# Editor / OS noise
+.DS_Store
+.idea/
+.vscode/

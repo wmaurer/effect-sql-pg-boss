@@ -1,0 +1,30 @@
+{
+    // The project for the repo's own tooling sources.
+    //
+    // Without it, oxlint.config.ts and the two generated rule lists belong to NO TypeScript
+    // project: tsconfig.json is a solution file, every package includes only its
+    // own src, and tsconfig.effect.json declares no inputs because it exists to
+    // be extended. A file in no project gets put in an INFERRED one by the
+    // language server, and there the Effect diagnostics run at the plugin's
+    // built-in severities — the very policy tsconfig.effect.json replaces. So
+    // the two files most likely to be edited by hand were the two the mirror
+    // did not govern, and `pnpm typecheck` never saw them either.
+    //
+    // Referenced from tsconfig.json, which is what puts these files in the
+    // `tsc -b` build and what tells an editor which project they belong to.
+    "extends": "./tsconfig.effect.json",
+    "compilerOptions": {
+        // tsconfig.base.json turns on `declaration`, `declarationMap` and
+        // `sourceMap`. This project only ever needs checking, and without
+        // `noEmit` a build would drop .js and .d.ts files beside the configs.
+        "noEmit": true,
+        // These are Node scripts: oxlint.config.ts imports `node:module` and
+        // `node:url`. Naming the one @types package keeps an unrelated global
+        // (a test runner's, a DOM lib's) from leaking in here.
+        "types": ["node"]
+    },
+    // Listed rather than globbed, because the root is not a source directory:
+    // a glob would sweep up whatever else lands beside these two. repos.config.js
+    // and the generated scripts/*.js are JavaScript and stay out.
+    "files": ["oxlint.config.ts", "effect-rules.ts", "correctness-rules.ts"]
+}

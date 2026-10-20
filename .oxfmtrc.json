@@ -1,0 +1,47 @@
+{
+    "$schema": "./node_modules/oxfmt/configuration_schema.json",
+    "printWidth": 120,
+    "tabWidth": 4,
+    "semi": true,
+    "singleQuote": false,
+    "trailingComma": "all",
+    "arrowParens": "always",
+    "endOfLine": "lf",
+    "proseWrap": "preserve",
+    "embeddedLanguageFormatting": "off",
+    "sortImports": {
+        "newlinesBetween": true,
+        "groups": [
+            "value-builtin",
+            "value-external",
+            "value-internal",
+            ["value-parent", "value-sibling", "value-index"],
+            "type-import",
+            "unknown"
+        ]
+    },
+    // Grouped by the scaffold feature each entry belongs to, so a project that took
+    // only some of them knows which lines to drop. Kept in step with
+    // oxlint.config.ts's ignorePatterns, which carries the same groups.
+    "ignorePatterns": [
+        // workspace
+        "**/dist",
+        "pnpm-lock.yaml",
+        // pnpm's own docs and every example in them write this file 2-space;
+        // tabWidth 4 would reindent it for no benefit.
+        "pnpm-workspace.yaml",
+        "scripts/typecheck.js",
+        // tsgo
+        "scripts/patch-tsgo.js",
+        // lint-sync
+        "scripts/lint-sync.js",
+        // anti-slop. Vendored upstream source; keep it byte-identical so it can be
+        // diffed against .repos/refs/anti-slop. See tools/oxlint/anti-slop/PROVENANCE.md.
+        "tools/oxlint/anti-slop/**",
+        // effect-native
+        "scripts/lint-types.js",
+        // repos
+        "scripts/repos.js",
+        ".repos/**"
+    ]
+}

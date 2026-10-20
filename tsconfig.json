@@ -1,0 +1,15 @@
+{
+    // A solution file: it compiles nothing itself, which is the usual shape for a
+    // workspace root. That is fine — each package's own tsconfig.json extends
+    // ./tsconfig.effect.json, and that is what makes the mirror reachable. See
+    // docs/features/lint-sync.md.
+    "files": [],
+    // Add each package here as you create it: { "path": "packages/core" }.
+    //
+    // tsconfig.tools.json is not a package. It is the project for the repo's own
+    // oxlint.config.ts and the two generated rule lists, which would otherwise belong to no
+    // project at all — see the comment in that file. It ships referenced so that
+    // `pnpm typecheck` covers them and the editor reads the generated mirror for
+    // them from the first commit, before any package exists.
+    "references": [{ "path": "tsconfig.tools.json" }]
+}
