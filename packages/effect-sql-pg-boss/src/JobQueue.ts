@@ -251,9 +251,16 @@ export interface Class<Self, Name extends string, S extends PayloadSchema> exten
     readonly options: QueueOptions;
 
     /**
-     * Creates the queue if it is missing, when the layer builds. Never in a
-     * request path: DDL on another connection could wait on the caller's own
-     * locks. Does not change the options of an existing queue.
+     * Creates the queue if it is missing and converges an existing one to the
+     * declared options, when the layer builds. Never in a request path: DDL on
+     * another connection could wait on the caller's own locks.
+     *
+     * Each declared option is written with pg-boss's `updateQueue` on every
+     * build. An option removed from the declaration keeps its stored value,
+     * because `updateQueue` leaves the fields it is not given alone. `policy`
+     * and `partition` cannot change after creation: the build fails with a
+     * `PgBossError` when the stored value differs from the declared one
+     * (`"standard"` and `false` when not declared).
      */
     readonly layer: Layer.Layer<Self, PgBossError | SqlError, PgBoss>;
 
@@ -357,11 +364,7 @@ export const Service =
                 Key,
                 Effect.gen(function* () {
                     const boss = yield* PgBoss;
-                    const pgBoss = boss[RuntimeId].boss;
-                    const existing = yield* Connection.call("getQueue", () => pgBoss.getQueue(name));
-                    if (existing === null) {
-                        yield* Connection.call("createQueue", () => pgBoss.createQueue(name, options));
-                    }
+                    yield* convergeQueue(boss[RuntimeId].boss, name, options);
                     return { queueName: name, boss };
                 }),
             );
@@ -426,6 +429,34 @@ export const Service =
                 );
         };
     };
+
+/**
+ * Brings the stored queue to `options`. `createQueue` leaves an existing
+ * queue alone, so creating first and updating after holds when another
+ * instance creates the same queue at the same moment.
+ */
+const convergeQueue = (boss: Boss.PgBoss, name: string, options: QueueOptions) =>
+    Effect.gen(function* () {
+        yield* Connection.call("createQueue", () => boss.createQueue(name, options));
+        const stored = yield* Connection.call("getQueue", () => boss.getQueue(name));
+        const { policy = "standard", partition = false, ...updatable } = options;
+        for (const [field, declared, actual] of [
+            ["policy", policy, stored?.policy],
+            ["partition", partition, stored?.partition],
+        ] as const) {
+            if (declared !== actual) {
+                return yield* new PgBossError({
+                    operation: "updateQueue",
+                    cause: new Error(
+                        `queue "${name}" has ${field} ${String(actual)}, but its declaration says ${String(declared)}; pg-boss cannot change ${field} after creation`,
+                    ),
+                });
+            }
+        }
+        if (Arr.isReadonlyArrayNonEmpty(Object.keys(updatable))) {
+            yield* Connection.call("updateQueue", () => boss.updateQueue(name, updatable));
+        }
+    });
 
 /**
  * Encodes a payload for pg-boss's `data` column.
