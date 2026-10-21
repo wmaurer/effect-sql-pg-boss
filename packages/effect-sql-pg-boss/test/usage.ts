@@ -157,6 +157,49 @@ export const ProgressWorker = AuditLog.worker(() => Effect.void, {
     onDecodeError: "drop",
 });
 
+// A dead-letter queue is declared first. The source queue names its class, and
+// its layer then requires the dead-letter queue's layer.
+const WorkPayload = Schema.Struct({ workId: Schema.String });
+class WorkFailed extends JobQueue.Service<WorkFailed>()("work-failed", { payload: WorkPayload, deadLetter: true }) {}
+class Work extends JobQueue.Service<Work>()("work", {
+    payload: WorkPayload,
+    options: { deadLetter: WorkFailed, retryLimit: 3 },
+}) {}
+
+// The handler of a dead-letter queue sees where each job came from.
+export const WorkFailedWorker = WorkFailed.worker(
+    (jobs) =>
+        Effect.forEach(jobs, (job) => Effect.logInfo(job.data.workId, job.source.id, job.source.output), {
+            discard: true,
+        }),
+    { transactional: true },
+);
+
+// Only a dead-letter queue's jobs have a source.
+export const NoSourceWorker = ShipOrder.worker(
+    // @ts-expect-error ship-order is not a dead-letter queue
+    (jobs) => Effect.logInfo(jobs[0].source),
+    { transactional: false },
+);
+
+// The dead-letter queue's payload is the source queue's payload.
+class OtherFailed extends JobQueue.Service<OtherFailed>()("other-failed", {
+    payload: Schema.Struct({ n: Schema.Finite }),
+    deadLetter: true,
+}) {}
+export class MismatchedPayload extends JobQueue.Service<MismatchedPayload>()("mismatched-payload", {
+    payload: WorkPayload,
+    // @ts-expect-error OtherFailed's payload is not WorkPayload
+    options: { deadLetter: OtherFailed },
+}) {}
+
+// Only a queue declared with `deadLetter: true` can be one.
+export class NotADeadLetterQueue extends JobQueue.Service<NotADeadLetterQueue>()("not-a-dead-letter-queue", {
+    payload: Schema.Struct({ orderId: Schema.BigInt }),
+    // @ts-expect-error ShipOrder is not declared with deadLetter: true
+    options: { deadLetter: ShipOrder },
+}) {}
+
 // Escape hatch.
 export const stats = PgBoss.use((boss) => boss.getQueueStats(ChargeCard.queueName));
 export const cancelCharge = (id: JobQueue.JobId) =>
@@ -187,6 +230,28 @@ export const AppLive = Layer.mergeAll(ChargeCardWorker, WelcomeEmailWorker).pipe
 // @ts-expect-error Unregistered's layer is not part of AppLive
 export const unregistered = Effect.runPromise(Unregistered.send({ n: 1 }).pipe(Effect.provide(AppLive)));
 // @effect-diagnostics missingEffectContext:error
+
+// A source queue whose dead-letter queue's layer is missing.
+// @effect-diagnostics missingEffectContext:off
+export const missingDeadLetter = Effect.runPromise(
+    // @ts-expect-error WorkFailed's layer is not provided
+    Work.send({ workId: "w" }).pipe(
+        Effect.provide(Work.layer.pipe(Layer.provideMerge(BossLive), Layer.provideMerge(SqlLive))),
+    ),
+);
+// @effect-diagnostics missingEffectContext:error
+
+export const withDeadLetter = Effect.runPromise(
+    Work.send({ workId: "w" }).pipe(
+        Effect.provide(
+            Work.layer.pipe(
+                Layer.provideMerge(WorkFailed.layer),
+                Layer.provideMerge(BossLive),
+                Layer.provideMerge(SqlLive),
+            ),
+        ),
+    ),
+);
 
 export const registered = Effect.runPromise(
     ChargeCard.send({ orderId: 1n, amountCents: 100 }).pipe(Effect.provide(AppLive)),
@@ -229,3 +294,21 @@ assertType<Equals<Layer.Services<typeof AppLive>, never>>(true);
 
 type BossLayer = typeof BossLive;
 assertType<Equals<BossLayer, Layer.Layer<PgBoss.PgBoss, PgBoss.PgBossError | SqlError, PgClient.PgClient>>>(true);
+
+type WorkLayerR = Layer.Services<typeof Work.layer>;
+assertType<Equals<WorkLayerR, PgBoss.PgBoss | WorkFailed>>(true);
+type WorkFailedJob = Parameters<Parameters<typeof WorkFailed.worker>[0]>[0][number];
+assertType<Equals<WorkFailedJob, JobQueue.DeadLetterJob<{ readonly workId: string }>>>(true);
+assertType<
+    Equals<
+        JobQueue.DeadLetterSource,
+        {
+            readonly id: JobQueue.JobId;
+            readonly queue: string;
+            readonly output: unknown;
+            readonly retryCount: number;
+            readonly rootId: JobQueue.JobId;
+            readonly createdOn: Date;
+        }
+    >
+>(true);

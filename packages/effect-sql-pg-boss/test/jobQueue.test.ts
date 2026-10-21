@@ -1,5 +1,5 @@
 import { assert, layer } from "@effect/vitest";
-import { Array as Arr, Effect, Layer, Logger, MutableRef, Order, pipe, Ref } from "effect";
+import { Array as Arr, Deferred, Effect, Layer, Logger, MutableRef, Order, pipe, Ref } from "effect";
 
 import { JobQueue, PgBoss } from "../src/index.ts";
 import { failure, JobData, layer as harness, maintenanceQuery, sendOutside, waitFor } from "./fixture.ts";
@@ -62,16 +62,33 @@ const captureLogs = () => {
     return { layer: Logger.layer([logger]), logged: () => MutableRef.get(logged) };
 };
 
+class DeadLetters extends JobQueue.Service<DeadLetters>()("dead-letters", { payload: JobData, deadLetter: true }) {}
+class Charges extends JobQueue.Service<Charges>()("charges", {
+    payload: JobData,
+    options: { deadLetter: DeadLetters, retryLimit: 1 },
+}) {}
+
 class SingletonPolicy extends JobQueue.Service<SingletonPolicy>()("fixed-policy", {
     payload: JobData,
     options: { policy: "singleton" },
 }) {}
 class StandardPolicy extends JobQueue.Service<StandardPolicy>()("fixed-policy", { payload: JobData }) {}
 
-layer(harness({ database: "job_queue" }, Layer.mergeAll(DecodeDrop.layer, DecodeDropAll.layer, DecodeFail.layer)), {
-    excludeTestServices: true,
-    timeout: "60 seconds",
-})("JobQueue", (it) => {
+layer(
+    harness(
+        { database: "job_queue" },
+        Layer.mergeAll(
+            DecodeDrop.layer,
+            DecodeDropAll.layer,
+            DecodeFail.layer,
+            Charges.layer.pipe(Layer.provideMerge(DeadLetters.layer)),
+        ),
+    ),
+    {
+        excludeTestServices: true,
+        timeout: "60 seconds",
+    },
+)("JobQueue", (it) => {
     it.effect("a queue layer converges an existing queue to its declared options", () =>
         Effect.gen(function* () {
             yield* Effect.scoped(Layer.build(ConvergeFirst.layer));
@@ -184,6 +201,48 @@ layer(harness({ database: "job_queue" }, Layer.mergeAll(DecodeDrop.layer, Decode
             ]);
             const { output } = yield* failure("fail-a", DecodeFail.queueName);
             assert.strictEqual(String(output?.message).split("\n")[0], "SchemaError: Expected boolean | null");
+        }),
+    );
+
+    it.effect("a job that fails past its retries reaches the dead-letter queue with its source", () =>
+        Effect.gen(function* () {
+            const chargeId = "3c9e1a7b-5d2f-4e8a-9b6c-1f0e2d3c4b5a";
+            const received = yield* Deferred.make<JobQueue.DeadLetterJob<JobData>>();
+            yield* Charges.send({ tag: "declined" }, { id: chargeId });
+            yield* Layer.build(
+                Charges.worker(() => Effect.fail("card declined"), {
+                    transactional: true,
+                    pollingIntervalSeconds: 0.5,
+                }),
+            );
+            yield* Layer.build(
+                DeadLetters.worker((jobs) => Deferred.succeed(received, Arr.headNonEmpty(jobs)), {
+                    transactional: true,
+                    pollingIntervalSeconds: 0.5,
+                }),
+            );
+            const job = yield* Deferred.await(received).pipe(Effect.timeout("15 seconds"));
+            const [failed] = yield* maintenanceQuery(
+                "select state, output, created_on from pgboss.job where name = 'charges' and id = $1",
+                [chargeId],
+            );
+
+            assert.deepStrictEqual(job.data, { tag: "declined" });
+            assert.strictEqual(job.queue, "dead-letters");
+            assert.deepStrictEqual(
+                {
+                    id: job.source.id,
+                    queue: job.source.queue,
+                    retryCount: job.source.retryCount,
+                    rootId: job.source.rootId,
+                },
+                { id: chargeId, queue: "charges", retryCount: 1, rootId: chargeId },
+            );
+            assert.strictEqual(failed?.state, "failed");
+            assert.deepStrictEqual(job.source.output, failed?.output, "the output the failed job stored");
+            assert.propertyVal(job.source.output, "name", "Error");
+            assert.propertyVal(job.source.output, "message", "Error: card declined");
+            assert.strictEqual(job.source.createdOn.getTime(), failed?.created_on.getTime());
         }),
     );
 });

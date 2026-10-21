@@ -72,12 +72,95 @@ export interface Job<A> {
 }
 
 /**
- * pg-boss queue options (retry, expiry, retention, policy, dead letter, ...).
+ * Where a job in a dead-letter queue came from: the job that failed past its
+ * retries. pg-boss stamps these fields when it copies the job, and the copy's
+ * `data` is the failed job's payload.
  *
  * @since 0.1.0
  * @category models
  */
-export type QueueOptions = Omit<Boss.Queue, "name">;
+export interface DeadLetterSource {
+    /** The id of the job that failed. */
+    readonly id: JobId;
+    /** The queue it failed on. */
+    readonly queue: string;
+    /**
+     * What it failed with: for a handler failure, the stored error; for a
+     * lost heartbeat, an expiry or a shutdown, pg-boss's own shape. Decode it
+     * with a schema of your own.
+     */
+    readonly output: unknown;
+    /** How many retries it used before it failed. */
+    readonly retryCount: number;
+    /**
+     * The id of the first job in its dead-letter chain. It is `id` unless the
+     * job was redriven from a dead-letter queue before.
+     */
+    readonly rootId: JobId;
+    /** When the job that failed was created. */
+    readonly createdOn: Date;
+}
+
+/**
+ * A job as the handler of a dead-letter queue sees it.
+ *
+ * @since 0.1.0
+ * @category models
+ */
+export interface DeadLetterJob<A> extends Job<A> {
+    readonly source: DeadLetterSource;
+}
+
+/**
+ * The job a queue's handler gets: a {@link DeadLetterJob} on a queue declared
+ * with `deadLetter: true`, a {@link Job} otherwise.
+ *
+ * @since 0.1.0
+ * @category models
+ */
+export type JobOf<IsDeadLetter extends boolean, A> = IsDeadLetter extends true ? DeadLetterJob<A> : Job<A>;
+
+/**
+ * A queue class declared with `deadLetter: true`, as a source queue's
+ * `deadLetter` option names it.
+ *
+ * @since 0.1.0
+ * @category models
+ */
+export interface DeadLetterQueue<S extends PayloadSchema = PayloadSchema> extends Context.Key<any, Registered<string>> {
+    readonly deadLetter: true;
+    readonly payload: S;
+}
+
+/**
+ * pg-boss queue options (retry, expiry, retention, policy, ...).
+ *
+ * `deadLetter` names the queue's dead-letter queue by its class, not by its
+ * name. The queue's layer then requires the dead-letter queue's layer, which
+ * creates that queue first, as pg-boss requires.
+ *
+ * @since 0.1.0
+ * @category models
+ */
+export interface QueueOptions<DeadLetter extends DeadLetterQueue = never> extends Omit<
+    Boss.Queue,
+    "name" | "deadLetter"
+> {
+    readonly deadLetter?: DeadLetter;
+}
+
+type Equals<A, B> = (<T>() => T extends A ? 1 : 2) extends <T>() => T extends B ? 1 : 2 ? true : false;
+
+/**
+ * `unknown` when the dead-letter queue's payload is the source queue's
+ * payload, and an object type no queue class satisfies when it is not.
+ * pg-boss copies the failed job's `data` unchanged, so the two schemas must
+ * agree on both the type and the encoding.
+ */
+type SamePayload<DL extends DeadLetterQueue, S extends PayloadSchema> =
+    Equals<[DL["payload"]["Type"], DL["payload"]["Encoded"]], [S["Type"], S["Encoded"]]> extends true
+        ? unknown
+        : { readonly "the dead-letter queue's payload must be this queue's payload": S["Type"] };
 
 /**
  * Per-job options for `send`. `db` is absent: the transaction comes from the
@@ -257,14 +340,18 @@ const insertFlow = <Q, R>(
  * @since 0.1.0
  * @category models
  */
-export interface Class<Self, Name extends string, S extends PayloadSchema> extends Context.ServiceClass<
+export interface Class<
     Self,
-    `@wmaurer/effect-sql-pg-boss/JobQueue/${Name}`,
-    Registered<Name>
-> {
+    Name extends string,
+    S extends PayloadSchema,
+    IsDeadLetter extends boolean = false,
+    DL extends DeadLetterQueue = never,
+> extends Context.ServiceClass<Self, `@wmaurer/effect-sql-pg-boss/JobQueue/${Name}`, Registered<Name>> {
     readonly queueName: Name;
     readonly payload: S;
-    readonly options: QueueOptions;
+    readonly options: QueueOptions<DL>;
+    /** Whether this is a dead-letter queue, whose jobs carry their `source`. */
+    readonly deadLetter: IsDeadLetter;
 
     /**
      * Creates the queue if it is missing and converges an existing one to the
@@ -277,8 +364,10 @@ export interface Class<Self, Name extends string, S extends PayloadSchema> exten
      * and `partition` cannot change after creation: the build fails with a
      * `PgBossError` when the stored value differs from the declared one
      * (`"standard"` and `false` when not declared).
+     *
+     * With a `deadLetter` option, it requires the dead-letter queue's layer.
      */
-    readonly layer: Layer.Layer<Self, PgBossError | SqlError, PgBoss>;
+    readonly layer: Layer.Layer<Self, PgBossError | SqlError, PgBoss | DL["Identifier"]>;
 
     /**
      * Encodes `payload` and sends one job, joining the fiber's transaction.
@@ -325,7 +414,7 @@ export interface Class<Self, Name extends string, S extends PayloadSchema> exten
      * fewer free connections than `PgBoss.layer`'s `connectionReserve`.
      */
     readonly worker: <E, R>(
-        handler: (jobs: Arr.NonEmptyReadonlyArray<Job<S["Type"]>>) => Effect.Effect<void, E, R>,
+        handler: (jobs: Arr.NonEmptyReadonlyArray<JobOf<IsDeadLetter, S["Type"]>>) => Effect.Effect<void, E, R>,
         options: WorkerOptions,
     ) => Layer.Layer<never, PgBossError, Self | R | S["DecodingServices"]>;
 }
@@ -349,28 +438,45 @@ export interface Class<Self, Name extends string, S extends PayloadSchema> exten
  */
 export const Service =
     <Self>() =>
-    <const Name extends string, S extends PayloadSchema>(
+    <
+        const Name extends string,
+        S extends PayloadSchema,
+        const IsDeadLetter extends boolean = false,
+        DL extends DeadLetterQueue = never,
+    >(
         name: Name,
         definition: {
             readonly payload: S;
-            readonly options?: QueueOptions | undefined;
+            /**
+             * Declares a dead-letter queue: its handler gets each job's
+             * `source`. Another queue names it with its `deadLetter` option.
+             */
+            readonly deadLetter?: IsDeadLetter;
+            readonly options?: QueueOptions<DL & SamePayload<DL, S>> | undefined;
         },
-    ): Class<Self, Name, S> => {
+    ): Class<Self, Name, S, IsDeadLetter, DL> => {
         const Key = Context.Service<Self, Registered<Name>>()(`@wmaurer/effect-sql-pg-boss/JobQueue/${name}`);
         const codec = Schema.toCodecJson(definition.payload);
         const encode = (payload: S["Type"]) => encodeObject(codec, payload);
         const decode = Schema.decodeUnknownEffect(codec);
         const options = definition.options ?? {};
         const runtimeOf = Effect.map(Key, (queue) => queue.boss[RuntimeId]);
+        const isDeadLetter = definition.deadLetter === true;
 
-        const decodeJob = (job: Boss.Job<unknown>) =>
-            Effect.map(decode(job.data), (data): Job<S["Type"]> => ({
+        const decodeJob = (
+            job: Boss.Job<unknown>,
+        ): Effect.Effect<Job<S["Type"]>, Schema.SchemaError, S["DecodingServices"]> => {
+            const decoded = Effect.map(decode(job.data), (data): Job<S["Type"]> => ({
                 id: JobId.make(job.id),
                 queue: job.name,
                 data,
                 retryCount: job.retryCount,
                 expireInSeconds: job.expireInSeconds,
             }));
+            return isDeadLetter
+                ? Effect.zipWith(decoded, decodeSource(job), (decodedJob, source) => ({ ...decodedJob, source }))
+                : decoded;
+        };
         const decodeBatchWith: Record<
             DecodeErrorPolicy,
             (
@@ -403,12 +509,19 @@ export const Service =
             static readonly queueName = name;
             static readonly payload = definition.payload;
             static readonly options = options;
+            // SAFETY: a definition without `deadLetter` leaves `IsDeadLetter` at its default, `false`.
+            static readonly deadLetter = isDeadLetter as IsDeadLetter;
 
             static readonly layer = Layer.effect(
                 Key,
                 Effect.gen(function* () {
                     const boss = yield* PgBoss;
-                    yield* convergeQueue(boss[RuntimeId].boss, name, options);
+                    const { deadLetter, ...rest } = options;
+                    // SAFETY: `DeadLetterQueue` widens a queue class's identifier to `any`; `DL` keeps it.
+                    const deadLetterKey = deadLetter as Context.Key<DL["Identifier"], Registered<string>> | undefined;
+                    const bossOptions =
+                        deadLetterKey === undefined ? rest : { ...rest, deadLetter: (yield* deadLetterKey).queueName };
+                    yield* convergeQueue(boss[RuntimeId].boss, name, bossOptions);
                     return { queueName: name, boss };
                 }),
             );
@@ -439,7 +552,7 @@ export const Service =
             });
 
             static readonly worker = <E, R>(
-                handler: (jobs: Arr.NonEmptyReadonlyArray<Job<S["Type"]>>) => Effect.Effect<void, E, R>,
+                handler: (jobs: Arr.NonEmptyReadonlyArray<JobOf<IsDeadLetter, S["Type"]>>) => Effect.Effect<void, E, R>,
                 workerOptions: WorkerOptions,
             ) =>
                 Layer.effectDiscard(
@@ -447,6 +560,11 @@ export const Service =
                         const runtime = yield* runtimeOf;
                         const { transactional, onDecodeError = "fail", ...work } = workerOptions;
                         const decodeBatch = decodeBatchWith[onDecodeError];
+                        // SAFETY: `JobOf<IsDeadLetter, A>` is `DeadLetterJob<A>` exactly when the definition says
+                        // `deadLetter: true`, and `decodeJob` adds `source` exactly then.
+                        const run = handler as (
+                            jobs: Arr.NonEmptyReadonlyArray<Job<S["Type"]>>,
+                        ) => Effect.Effect<void, E, R>;
                         if (transactional) {
                             yield* runtime.reserveConnections(name, work.localConcurrency ?? 1);
                         }
@@ -455,13 +573,13 @@ export const Service =
                             try: () =>
                                 runtime.boss.work(
                                     name,
-                                    { ...work, transactional },
+                                    { ...work, transactional, includeMetadata: isDeadLetter },
                                     WorkerTransaction.workCallback({
                                         transactional,
                                         context,
                                         handler: (jobs) =>
                                             Effect.flatMap(decodeBatch(jobs), (decoded) =>
-                                                Arr.isReadonlyArrayNonEmpty(decoded) ? handler(decoded) : Effect.void,
+                                                Arr.isReadonlyArrayNonEmpty(decoded) ? run(decoded) : Effect.void,
                                             ),
                                     }),
                                 ),
@@ -480,7 +598,7 @@ export const Service =
  * queue alone, so creating first and updating after holds when another
  * instance creates the same queue at the same moment.
  */
-const convergeQueue = (boss: Boss.PgBoss, name: string, options: QueueOptions) =>
+const convergeQueue = (boss: Boss.PgBoss, name: string, options: Omit<Boss.Queue, "name">) =>
     Effect.gen(function* () {
         yield* Connection.call("createQueue", () => boss.createQueue(name, options));
         const stored = yield* Connection.call("getQueue", () => boss.getQueue(name));
@@ -504,11 +622,29 @@ const convergeQueue = (boss: Boss.PgBoss, name: string, options: QueueOptions) =
     });
 
 /**
- * Encodes a payload for pg-boss's `data` column.
- *
- * `PayloadSchema` requires an `Encoded` that is an object, and `toCodecJson`
- * keeps that shape. Its type widens the result to any `Json`.
+ * The fields pg-boss stamps on a dead-letter copy. A job in a dead-letter
+ * queue that pg-boss did not copy there has none of them, and fails to decode.
  */
+const SourceFields = Schema.Struct({
+    sourceId: JobId,
+    sourceName: Schema.String,
+    sourceOutput: Schema.Unknown,
+    sourceRetryCount: Schema.Int,
+    sourceRootId: JobId,
+    sourceCreatedOn: Schema.Date,
+});
+
+const decodeSource = (job: Boss.Job<unknown>): Effect.Effect<DeadLetterSource, Schema.SchemaError> =>
+    Effect.map(Schema.decodeUnknownEffect(SourceFields)(job), (fields) => ({
+        id: fields.sourceId,
+        queue: fields.sourceName,
+        output: fields.sourceOutput,
+        retryCount: fields.sourceRetryCount,
+        rootId: fields.sourceRootId,
+        createdOn: fields.sourceCreatedOn,
+    }));
+
+/** Encodes a payload for pg-boss's `data` column, which must be an object. */
 const encodeObject = <S extends PayloadSchema>(
     codec: Schema.toCodecJson<S>,
     payload: S["Type"],
