@@ -1,22 +1,32 @@
 import { assert, layer } from "@effect/vitest";
-import { Array as Arr, Deferred, Effect, Option, Record, Ref } from "effect";
+import { Array as Arr, Deferred, Effect, Layer, Option, Record, Ref } from "effect";
 
+import { JobQueue } from "../src/index.ts";
 import * as Connection from "../src/internal/connection.ts";
 import {
     appNotes,
     failure,
     Harness,
+    JobData,
     jobStates,
     layer as harness,
     maintenanceQuery,
-    send,
     sendOutside,
     timeline,
     transactionOf,
     UUID,
     waitFor,
-    work,
 } from "./fixture.ts";
+
+class P1 extends JobQueue.Service<P1>()("p1", { payload: JobData, options: { retryLimit: 0 } }) {}
+class P1Follow extends JobQueue.Service<P1Follow>()("p1-follow", { payload: JobData }) {}
+class P2 extends JobQueue.Service<P2>()("p2", { payload: JobData, options: { retryLimit: 0, expireInSeconds: 2 } }) {}
+class P2b extends JobQueue.Service<P2b>()("p2b", {
+    payload: JobData,
+    options: { retryLimit: 0, expireInSeconds: 1 },
+}) {}
+
+const polled = { transactional: true, pollingIntervalSeconds: 0.5 } as const;
 
 /** A server log line without its pid prefix or the client's prepared statement name. */
 const normalize = (line: string) =>
@@ -53,17 +63,10 @@ const transactionEnd = (lines: ReadonlyArray<string>, tag: string) =>
             ),
     );
 
-layer(
-    harness({
-        database: "worker_transaction",
-        queues: [
-            ["p1", { retryLimit: 0 }],
-            ["p1-follow", {}],
-            ["p2", { retryLimit: 0, expireInSeconds: 2 }],
-        ],
-    }),
-    { excludeTestServices: true, timeout: "60 seconds" },
-)("the parked worker transaction", (it) => {
+layer(harness({ database: "worker_transaction" }, Layer.mergeAll(P1.layer, P1Follow.layer, P2.layer)), {
+    excludeTestServices: true,
+    timeout: "60 seconds",
+})("the parked worker transaction", (it) => {
     it.effect("P1: the handler's writes, savepoints and sends commit with the job, or roll back with it", () =>
         Effect.gen(function* () {
             const { sql, serverLog } = yield* Harness;
@@ -71,37 +74,46 @@ layer(
             const seen = yield* Ref.make<
                 Record<string, { readonly sameTx: boolean; readonly followId: string; readonly pid: number }>
             >({});
-            yield* work("p1", (job) =>
-                Effect.gen(function* () {
-                    const [row] = yield* sql<{ readonly pid: number }>`select pg_backend_pid() as pid`;
-                    yield* sql`insert into app ${sql.insert({ tag: job.tag, note: "outer" })}`;
-                    yield* sql.withTransaction(
-                        sql`insert into app ${sql.insert({ tag: job.tag, note: "nested-savepoint" })}`,
-                    );
-                    yield* sql
-                        .withTransaction(
-                            Effect.andThen(
-                                sql`insert into app ${sql.insert({ tag: job.tag, note: "nested-rolled-back" })}`,
-                                Effect.fail("rolled back on purpose"),
-                            ),
-                        )
-                        .pipe(Effect.ignore);
-                    const handlerDb = yield* Connection.currentDb(sql);
-                    const pgBossTx = yield* transactionOf(job.tag);
-                    const followId = yield* send("p1-follow", { tag: job.tag });
-                    yield* Ref.update(
-                        seen,
-                        Record.set(job.tag, {
-                            sameTx: Option.contains(pgBossTx, handlerDb),
-                            followId: String(followId),
-                            pid: row?.pid ?? 0,
-                        }),
-                    );
-                    if (job.fail === true) {
-                        yield* handler.mark("failing");
-                        return yield* Effect.die(new Error("handler failed on purpose"));
-                    }
-                }),
+            yield* Layer.build(
+                P1.worker(
+                    (jobs) =>
+                        Effect.forEach(
+                            jobs,
+                            ({ data: job }) =>
+                                Effect.gen(function* () {
+                                    const [row] = yield* sql<{ readonly pid: number }>`select pg_backend_pid() as pid`;
+                                    yield* sql`insert into app ${sql.insert({ tag: job.tag, note: "outer" })}`;
+                                    yield* sql.withTransaction(
+                                        sql`insert into app ${sql.insert({ tag: job.tag, note: "nested-savepoint" })}`,
+                                    );
+                                    yield* sql
+                                        .withTransaction(
+                                            Effect.andThen(
+                                                sql`insert into app ${sql.insert({ tag: job.tag, note: "nested-rolled-back" })}`,
+                                                Effect.fail("rolled back on purpose"),
+                                            ),
+                                        )
+                                        .pipe(Effect.ignore);
+                                    const handlerDb = yield* Connection.currentDb(sql);
+                                    const pgBossTx = yield* transactionOf(job.tag);
+                                    const followId = yield* P1Follow.send({ tag: job.tag });
+                                    yield* Ref.update(
+                                        seen,
+                                        Record.set(job.tag, {
+                                            sameTx: Option.contains(pgBossTx, handlerDb),
+                                            followId: Option.getOrElse(followId, () => ""),
+                                            pid: row?.pid ?? 0,
+                                        }),
+                                    );
+                                    if (job.fail === true) {
+                                        yield* handler.mark("failing");
+                                        return yield* Effect.die(new Error("handler failed on purpose"));
+                                    }
+                                }),
+                            { discard: true },
+                        ),
+                    polled,
+                ),
             );
             yield* sendOutside("p1", { tag: "p1-ok", fail: false });
             yield* sendOutside("p1", { tag: "p1-bad", fail: true });
@@ -167,15 +179,24 @@ layer(
             const { sql, serverLog } = yield* Harness;
             const handler = yield* timeline;
             const backend = yield* Deferred.make<number>();
-            yield* work("p2", (job) =>
-                Effect.gen(function* () {
-                    const [row] = yield* sql<{ readonly pid: number }>`select pg_backend_pid() as pid`;
-                    yield* Deferred.succeed(backend, row?.pid ?? 0);
-                    yield* handler.mark("started");
-                    yield* sql`select pg_sleep(10)`;
-                    yield* sql`insert into app ${sql.insert({ tag: job.tag, note: "after-sleep" })}`;
-                    yield* handler.mark("finished");
-                }).pipe(Effect.onInterrupt(() => handler.mark("interrupted"))),
+            yield* Layer.build(
+                P2.worker(
+                    (jobs) =>
+                        Effect.forEach(
+                            jobs,
+                            ({ data: job }) =>
+                                Effect.gen(function* () {
+                                    const [row] = yield* sql<{ readonly pid: number }>`select pg_backend_pid() as pid`;
+                                    yield* Deferred.succeed(backend, row?.pid ?? 0);
+                                    yield* handler.mark("started");
+                                    yield* sql`select pg_sleep(10)`;
+                                    yield* sql`insert into app ${sql.insert({ tag: job.tag, note: "after-sleep" })}`;
+                                    yield* handler.mark("finished");
+                                }).pipe(Effect.onInterrupt(() => handler.mark("interrupted"))),
+                            { discard: true },
+                        ),
+                    polled,
+                ),
             );
             yield* sendOutside("p2", { tag: "p2-abandon" });
             yield* waitFor("p2-abandon", "p2", "failed");
@@ -230,25 +251,30 @@ layer(
     );
 });
 
-layer(
-    harness({
-        database: "worker_transaction_bounded",
-        queues: [["p2b", { retryLimit: 0, expireInSeconds: 1 }]],
-        rollbackTimeout: "1 second",
-    }),
-    { excludeTestServices: true, timeout: "60 seconds" },
-)("the bounded rollback", (it) => {
+layer(harness({ database: "worker_transaction_bounded", rollbackTimeout: "1 second" }, P2b.layer), {
+    excludeTestServices: true,
+    timeout: "60 seconds",
+})("the bounded rollback", (it) => {
     it.effect("P2b: rollback() gives up after rollbackTimeout on a handler that ignores interruption", () =>
         Effect.gen(function* () {
             const { sql } = yield* Harness;
             const handler = yield* timeline;
-            yield* work("p2b", (job) =>
-                Effect.gen(function* () {
-                    yield* handler.mark("started");
-                    yield* Effect.uninterruptible(Effect.sleep("4 seconds"));
-                    yield* handler.mark("woke up");
-                    yield* sql`insert into app ${sql.insert({ tag: job.tag, note: "after-wedge" })}`;
-                }).pipe(Effect.onInterrupt(() => handler.mark("interrupted"))),
+            yield* Layer.build(
+                P2b.worker(
+                    (jobs) =>
+                        Effect.forEach(
+                            jobs,
+                            ({ data: job }) =>
+                                Effect.gen(function* () {
+                                    yield* handler.mark("started");
+                                    yield* Effect.uninterruptible(Effect.sleep("4 seconds"));
+                                    yield* handler.mark("woke up");
+                                    yield* sql`insert into app ${sql.insert({ tag: job.tag, note: "after-wedge" })}`;
+                                }).pipe(Effect.onInterrupt(() => handler.mark("interrupted"))),
+                            { discard: true },
+                        ),
+                    polled,
+                ),
             );
             yield* sendOutside("p2b", { tag: "p2b-wedged" });
             yield* waitFor("p2b-wedged", "p2b", "failed");

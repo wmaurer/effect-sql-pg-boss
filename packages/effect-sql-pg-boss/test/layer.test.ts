@@ -2,23 +2,33 @@ import { PgClient } from "@effect/sql-pg";
 import { assert, layer } from "@effect/vitest";
 import { Array as Arr, Clock, Context, Deferred, Effect, Exit, Layer, Logger, MutableRef, Scope } from "effect";
 
-import { PgBoss } from "../src/index.ts";
+import { JobQueue, PgBoss } from "../src/index.ts";
 import * as Connection from "../src/internal/connection.ts";
 import { RuntimeId } from "../src/internal/runtime.ts";
-import * as WorkerTransaction from "../src/internal/workerTransaction.ts";
 import {
     appNotes,
     databaseUrl,
     failure,
     Harness,
+    JobData,
     jobStates,
     layer as harness,
     sendOutside,
     timeline,
     UUID,
     waitFor,
-    work,
 } from "./fixture.ts";
+
+class UseSend extends JobQueue.Service<UseSend>()("use-send", { payload: JobData }) {}
+class CommitFails extends JobQueue.Service<CommitFails>()("commit-fails", {
+    payload: JobData,
+    options: { retryLimit: 0 },
+}) {}
+class Shutdown extends JobQueue.Service<Shutdown>()("shutdown", { payload: JobData, options: { retryLimit: 0 } }) {}
+class BeginFails extends JobQueue.Service<BeginFails>()("begin-fails", {
+    payload: JobData,
+    options: { retryLimit: 0 },
+}) {}
 
 const DATABASE = "pg_boss_layer";
 
@@ -38,15 +48,7 @@ const backendsOf = (applicationName: string) =>
     });
 
 layer(
-    harness({
-        database: DATABASE,
-        queues: [
-            ["use-send", {}],
-            ["commit-fails", { retryLimit: 0 }],
-            ["shutdown", { retryLimit: 0 }],
-            ["begin-fails", { retryLimit: 0 }],
-        ],
-    }),
+    harness({ database: DATABASE }, Layer.mergeAll(UseSend.layer, CommitFails.layer, Shutdown.layer, BeginFails.layer)),
     { excludeTestServices: true, timeout: "60 seconds" },
 )("PgBoss.layer", (it) => {
     it.effect("use passes {} outside a transaction and the transaction's db inside one", () =>
@@ -69,7 +71,9 @@ layer(
                 sql.withTransaction(
                     Effect.gen(function* () {
                         yield* sql`insert into app ${sql.insert({ tag, note: "app" })}`;
-                        const id = yield* PgBoss.use((boss, connection) => boss.send("use-send", { tag }, connection));
+                        const id = yield* PgBoss.use((boss, connection) =>
+                            boss.send(UseSend.queueName, { tag }, connection),
+                        );
                         if (fail) return yield* Effect.fail("app rollback");
                         return id;
                     }),
@@ -117,12 +121,18 @@ layer(
             const { sql } = yield* Harness;
             yield* sql`create table deferred_unique (id int unique deferrable initially deferred)`;
             const handler = yield* timeline;
-            yield* work("commit-fails", (job) =>
-                Effect.gen(function* () {
-                    yield* sql`insert into app ${sql.insert({ tag: job.tag, note: "app" })}`;
-                    yield* sql`insert into deferred_unique values (1), (1)`;
-                    yield* handler.mark("returned");
-                }),
+            yield* Layer.build(
+                CommitFails.worker(
+                    (jobs) =>
+                        Effect.gen(function* () {
+                            for (const { data } of jobs) {
+                                yield* sql`insert into app ${sql.insert({ tag: data.tag, note: "app" })}`;
+                            }
+                            yield* sql`insert into deferred_unique values (1), (1)`;
+                            yield* handler.mark("returned");
+                        }),
+                    { transactional: true, pollingIntervalSeconds: 0.5 },
+                ),
             );
             yield* sendOutside("commit-fails", { tag: "commit-fails" });
             yield* waitFor("commit-fails", "commit-fails", "failed");
@@ -140,30 +150,25 @@ layer(
         Effect.gen(function* () {
             const applicationName = "pg-boss-shutdown-test";
             const scope = yield* Scope.make();
-            const context = yield* Layer.buildWithScope(
-                bossOn({ applicationName }, { stop: { timeout: 2000 } }),
-                scope,
-            );
-            const sql = Context.get(context, PgClient.PgClient);
-            const { boss } = Context.get(context, PgBoss.PgBoss)[RuntimeId];
             const handler = yield* timeline;
             const started = yield* Deferred.make<void>();
-            yield* Connection.call("work", () =>
-                boss.work(
-                    "shutdown",
-                    { transactional: true, pollingIntervalSeconds: 0.5 },
-                    WorkerTransaction.workCallback({
-                        transactional: true,
-                        context: Context.empty(),
-                        handler: () =>
-                            Effect.gen(function* () {
-                                yield* sql`insert into app ${sql.insert({ tag: "shutdown", note: "before-stop" })}`;
-                                yield* Deferred.succeed(started, undefined);
-                                yield* Effect.sleep("60 seconds");
-                                yield* handler.mark("woke up");
-                            }).pipe(Effect.onInterrupt(() => handler.mark("interrupted"))),
-                    }),
+            const worker = Shutdown.worker(
+                () =>
+                    Effect.gen(function* () {
+                        const sql = yield* PgClient.PgClient;
+                        yield* sql`insert into app ${sql.insert({ tag: "shutdown", note: "before-stop" })}`;
+                        yield* Deferred.succeed(started, undefined);
+                        yield* Effect.sleep("60 seconds");
+                        yield* handler.mark("woke up");
+                    }).pipe(Effect.onInterrupt(() => handler.mark("interrupted"))),
+                { transactional: true, pollingIntervalSeconds: 0.5 },
+            );
+            yield* Layer.buildWithScope(
+                worker.pipe(
+                    Layer.provideMerge(Layer.fresh(Shutdown.layer)),
+                    Layer.provideMerge(bossOn({ applicationName }, { stop: { timeout: 2000 } })),
                 ),
+                scope,
             );
             yield* sendOutside("shutdown", { tag: "shutdown" });
             yield* Deferred.await(started);
@@ -191,22 +196,17 @@ layer(
             const handler = yield* timeline;
             yield* Effect.scoped(
                 Effect.gen(function* () {
-                    const context = yield* Layer.build(bossOn({ startupParameters: { statement_timeout: "never" } }));
-                    const { boss } = Context.get(context, PgBoss.PgBoss)[RuntimeId];
-                    const id = yield* Connection.call("work", () =>
-                        boss.work(
-                            "begin-fails",
-                            { transactional: true, pollingIntervalSeconds: 0.5 },
-                            WorkerTransaction.workCallback({
-                                transactional: true,
-                                context: Context.empty(),
-                                handler: () => handler.mark("ran"),
-                            }),
+                    yield* Layer.build(
+                        BeginFails.worker(() => handler.mark("ran"), {
+                            transactional: true,
+                            pollingIntervalSeconds: 0.5,
+                        }).pipe(
+                            Layer.provideMerge(Layer.fresh(BeginFails.layer)),
+                            Layer.provide(bossOn({ startupParameters: { statement_timeout: "never" } })),
                         ),
                     );
                     yield* sendOutside("begin-fails", { tag: "begin-fails" });
                     yield* waitFor("begin-fails", "begin-fails", "failed");
-                    yield* Effect.promise(() => boss.offWork("begin-fails", { id, wait: true }));
                 }),
             );
             assert.isFalse(yield* handler.reached("ran"));

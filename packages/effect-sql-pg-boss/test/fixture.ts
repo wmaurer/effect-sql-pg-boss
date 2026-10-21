@@ -1,6 +1,7 @@
 /**
- * `PgBoss.layer` over a `PgClient` on a database of the test file's own.
- * Tests reach pg-boss and the internals only through the layer's runtime.
+ * `PgBoss.layer` over a `PgClient` on a database of the test file's own, with
+ * the test file's queue classes on top. Tests reach pg-boss and the internals
+ * only through the layer's runtime.
  */
 import { PgClient } from "@effect/sql-pg";
 import { Array as Arr, Clock, Context, Effect, Layer, Option, Record, Redacted, Ref, Schedule, Schema } from "effect";
@@ -9,14 +10,17 @@ import { inject } from "vitest";
 import { PgBoss } from "../src/index.ts";
 import * as Connection from "../src/internal/connection.ts";
 import { RuntimeId } from "../src/internal/runtime.ts";
-import * as WorkerTransaction from "../src/internal/workerTransaction.ts";
 import { docker } from "./docker.ts";
 
 import type { Duration } from "effect";
 import type * as Boss from "pg-boss";
 
 /** What every test job carries. `tag` names the job's rows in `app` and in `pgboss.job`. */
-export const JobData = Schema.Struct({ tag: Schema.String, fail: Schema.optional(Schema.Boolean) });
+export const JobData = Schema.Struct({
+    tag: Schema.String,
+    fail: Schema.optional(Schema.Boolean),
+    note: Schema.optional(Schema.String),
+});
 export type JobData = typeof JobData.Type;
 
 /** A pg-boss job id. */
@@ -37,7 +41,6 @@ export class Harness extends Context.Service<
 export interface Options {
     /** Names the test file's database. */
     readonly database: string;
-    readonly queues: ReadonlyArray<readonly [name: string, options: Omit<Boss.Queue, "name">]>;
     readonly rollbackTimeout?: Duration.Input;
 }
 
@@ -72,30 +75,51 @@ const serverLog = (container: string) => (pid: number) =>
         Arr.filter(logs.split("\n"), (line) => line.startsWith(`[${pid}] `)),
     );
 
-const harness = (options: Options) =>
-    Layer.effect(
-        Harness,
-        Effect.gen(function* () {
-            const sql = yield* PgClient.PgClient;
-            const { boss } = (yield* PgBoss.PgBoss)[RuntimeId];
-            for (const [name, queue] of options.queues) {
-                yield* Connection.call("createQueue", () => boss.createQueue(name, queue));
+/**
+ * Wraps `boss.work` so each transactional batch's `tx` is recorded under the
+ * tag of its first job. The handler still gets the same `tx`, unchanged.
+ */
+const recordTransactions = (boss: Boss.PgBoss, transactions: Ref.Ref<Record<string, Connection.Db>>) => {
+    const work = boss.work.bind(boss);
+    const decode = Schema.decodeUnknownOption(JobData);
+    type Handler = (jobs: Array<Boss.Job<unknown>>, tx?: Connection.Db) => Promise<void>;
+    // SAFETY: the wrapper accepts the three-argument overload every worker in this suite uses, and
+    // passes each argument through; only the handler is wrapped, with the same parameters.
+    boss.work = ((name: string, options: Boss.WorkOptions, handler: Handler) =>
+        work(name, options, (jobs: Array<Boss.Job<unknown>>, tx?: Connection.Db) => {
+            const data = decode(jobs[0]?.data);
+            if (Option.isSome(data) && tx !== undefined) {
+                Effect.runSync(Ref.update(transactions, Record.set(data.value.tag, tx)));
             }
-            yield* sql`create table app (tag text, note text, created_on int8 default 1)`;
+            return handler(jobs, tx);
+        })) as typeof boss.work;
+};
 
-            const container = inject("postgresContainer");
-            return Harness.of({
-                sql,
-                boss,
-                transactions: yield* Ref.make<Record<string, Connection.Db>>({}),
-                serverLog: container === undefined ? Option.none() : Option.some(serverLog(container)),
-            });
-        }),
-    );
+const harness = Layer.effect(
+    Harness,
+    Effect.gen(function* () {
+        const sql = yield* PgClient.PgClient;
+        const { boss } = (yield* PgBoss.PgBoss)[RuntimeId];
+        yield* sql`create table app (tag text, note text, created_on int8 default 1)`;
 
-/** `PgBoss.layer` started on the app's `PgClient`, over a fresh database. Its scope stops pg-boss. */
-export const layer = (options: Options) =>
-    harness(options).pipe(
+        const transactions = yield* Ref.make<Record<string, Connection.Db>>({});
+        recordTransactions(boss, transactions);
+        const container = inject("postgresContainer");
+        return Harness.of({
+            sql,
+            boss,
+            transactions,
+            serverLog: container === undefined ? Option.none() : Option.some(serverLog(container)),
+        });
+    }),
+);
+
+/**
+ * `PgBoss.layer` started on the app's `PgClient`, over a fresh database, with
+ * `queues` (the test file's queue layers) built on it. Its scope stops pg-boss.
+ */
+export const layer = <A, E>(options: Options, queues: Layer.Layer<A, E, PgBoss.PgBoss>) =>
+    Layer.provideMerge(queues, harness).pipe(
         Layer.provideMerge(
             PgBoss.layer({
                 schema: "pgboss",
@@ -108,40 +132,6 @@ export const layer = (options: Options) =>
         Layer.provide(database(options.database)),
     );
 
-/**
- * Works `queue` with a transactional worker, as `JobQueue.worker` will: the
- * handler runs through `WorkerTransaction.workCallback`, once per job.
- */
-export const work = <E, R>(queue: string, handler: (job: JobData) => Effect.Effect<void, E, R>) =>
-    Effect.gen(function* () {
-        const { boss, transactions } = yield* Harness;
-        const context = yield* Effect.context<R>();
-        const decode = Schema.decodeUnknownEffect(JobData);
-        const id = yield* Connection.call("work", () =>
-            boss.work(queue, { transactional: true, pollingIntervalSeconds: 0.5 }, (jobs, tx) =>
-                WorkerTransaction.workCallback({
-                    transactional: true,
-                    context,
-                    handler: (batch) =>
-                        Effect.forEach(
-                            batch,
-                            (job, index) =>
-                                Effect.flatMap(decode(job.data), (data) =>
-                                    index === 0
-                                        ? Effect.andThen(
-                                              Ref.update(transactions, Record.set(data.tag, tx)),
-                                              handler(data),
-                                          )
-                                        : handler(data),
-                                ),
-                            { discard: true },
-                        ),
-                })(jobs, tx),
-            ),
-        );
-        yield* Effect.addFinalizer(() => Effect.promise(() => boss.offWork(queue, { id, wait: true })));
-    });
-
 /** The `tx` pg-boss handed the batch whose first job has this tag. */
 export const transactionOf = (tag: string) =>
     Effect.gen(function* () {
@@ -149,19 +139,8 @@ export const transactionOf = (tag: string) =>
         return Record.get(yield* Ref.get(transactions), tag);
     });
 
-/** Sends a job on the fiber's transaction, as `Queue.send` will. */
-export const send = (queue: string, data: JobData) =>
-    Effect.gen(function* () {
-        const { boss, sql } = yield* Harness;
-        return yield* Connection.withDb(sql, (db) => Connection.call("send", () => boss.send(queue, data, { db })));
-    });
-
 /** Sends a job on pg-boss's own connections, as a producer outside the app would. */
-export const sendOutside = (queue: string, data: JobData) =>
-    Effect.gen(function* () {
-        const { boss } = yield* Harness;
-        return yield* Connection.call("send", () => boss.send(queue, data));
-    });
+export const sendOutside = (queue: string, data: JobData) => PgBoss.use((boss) => boss.send(queue, data));
 
 /** Runs a statement on pg-boss's maintenance connections, apart from the app's pool. */
 export const maintenanceQuery = (text: string, values: ReadonlyArray<unknown>) =>

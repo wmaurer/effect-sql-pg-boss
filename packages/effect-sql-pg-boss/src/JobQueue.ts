@@ -1,6 +1,16 @@
+import * as Arr from "effect/Array";
+import * as Context from "effect/Context";
+import * as Effect from "effect/Effect";
+import * as Layer from "effect/Layer";
+import * as Option from "effect/Option";
+import * as Record from "effect/Record";
 import * as Schema from "effect/Schema";
 
-import type { PgBoss, PgBossError } from "./PgBoss.ts";
+import * as Connection from "./internal/connection.ts";
+import { RuntimeId } from "./internal/runtime.ts";
+import * as WorkerTransaction from "./internal/workerTransaction.ts";
+import { PgBoss, PgBossError } from "./PgBoss.ts";
+
 /**
  * Typed pg-boss queues.
  *
@@ -15,11 +25,6 @@ import type { PgBoss, PgBossError } from "./PgBoss.ts";
  *
  * @since 0.1.0
  */
-import type * as Arr from "effect/Array";
-import type * as Context from "effect/Context";
-import type * as Effect from "effect/Effect";
-import type * as Layer from "effect/Layer";
-import type * as Option from "effect/Option";
 import type { SqlError } from "effect/sql/SqlError";
 import type * as Boss from "pg-boss";
 
@@ -125,7 +130,7 @@ export type WorkerOptions = Pick<
     | "heartbeatRefreshSeconds"
 > &
     (
-        | { readonly transactional: true; readonly transactionTimeoutSeconds?: number | undefined }
+        | { readonly transactional: true; readonly transactionTimeoutSeconds?: number }
         | { readonly transactional: false; readonly transactionTimeoutSeconds?: never }
     );
 
@@ -138,7 +143,7 @@ export type WorkerOptions = Pick<
  */
 export interface Registered<Name extends string> {
     readonly queueName: Name;
-    readonly boss: PgBoss;
+    readonly boss: PgBoss["Service"];
 }
 
 const StepTypeId: unique symbol = Symbol.for("@wmaurer/effect-sql-pg-boss/JobQueue/Step");
@@ -155,9 +160,11 @@ const StepTypeId: unique symbol = Symbol.for("@wmaurer/effect-sql-pg-boss/JobQue
  */
 export interface Step<out Self, out Refs extends ReadonlyArray<string>, out R = never> {
     readonly [StepTypeId]: (_: never) => Self;
+    /** The queue's service, which holds the pg-boss the flow runs on. */
+    readonly queue: Effect.Effect<Registered<string>, never, Self>;
     readonly queueName: string;
-    readonly dependsOn: Refs;
-    readonly job: JobInsertOptions | undefined;
+    readonly dependsOn: ReadonlyArray<Refs[number]>;
+    readonly job: JobInsertOptions;
     /** The payload, encoded when the flow runs. */
     readonly encoded: Effect.Effect<object, Schema.SchemaError, R>;
 }
@@ -196,21 +203,37 @@ export declare namespace Step {
  * @category flows
  */
 export const flow = <const Steps extends Record<string, Step<any, ReadonlyArray<string>, any>>>(
-    _steps: Steps & Step.ValidRefs<Steps>,
+    steps: Steps & Step.ValidRefs<Steps>,
 ): Effect.Effect<
     { readonly [K in keyof Steps]: JobId },
     SqlError | PgBossError | Schema.SchemaError,
     Step.Queues<Steps> | Step.Services<Steps>
-> => {
-    // TODO: implement as below. pg-boss returns exactly one id per ref or rejects.
-    // ```ts
-    // const runtime = (yield* first step's queue service).boss[RuntimeId]
-    // const jobs = yield* Effect.forEach(Object.entries(steps), ([ref, step]) =>
-    //   Effect.map(step.encoded, (data) => ({ ref, name: step.queueName, data, options: step.job, dependsOn: [...step.dependsOn] })))
-    // return yield* Connection.withDb(runtime.sql, (db) => Connection.call("flow", () => runtime.boss.flow(jobs, { db })))
-    // ```
-    throw new Error("not implemented");
-};
+> =>
+    // SAFETY: pg-boss returns exactly one id for each ref, and the refs are the keys of `steps`.
+    insertFlow<Step.Queues<Steps>, Step.Services<Steps>>(steps) as Effect.Effect<
+        { readonly [K in keyof Steps]: JobId },
+        SqlError | PgBossError | Schema.SchemaError,
+        Step.Queues<Steps> | Step.Services<Steps>
+    >;
+
+const insertFlow = <Q, R>(
+    steps: Record<string, Step<Q, ReadonlyArray<string>, R>>,
+): Effect.Effect<Record<string, JobId>, SqlError | PgBossError | Schema.SchemaError, Q | R> =>
+    Effect.gen(function* () {
+        const prepared = yield* Effect.forEach(Record.toEntries(steps), ([ref, step]) =>
+            Effect.zipWith(step.queue, step.encoded, (queue, data) => ({
+                runtime: queue.boss[RuntimeId],
+                job: { ref, name: step.queueName, data, options: step.job, dependsOn: [...step.dependsOn] },
+            })),
+        );
+        if (!Arr.isReadonlyArrayNonEmpty(prepared)) return {};
+        const { runtime } = Arr.headNonEmpty(prepared);
+        const jobs = Arr.map(prepared, ({ job }) => job);
+        const ids = yield* Connection.withDb(runtime.sql, (db) =>
+            Connection.call("flow", () => runtime.boss.flow(jobs, { db })),
+        );
+        return Record.map(ids, (id) => JobId.make(id));
+    });
 
 /**
  * The class `JobQueue.Service` returns.
@@ -256,7 +279,11 @@ export interface Class<Self, Name extends string, S extends PayloadSchema> exten
 
     /**
      * Works the queue while the layer is alive. Closing the layer calls
-     * `offWork` and waits for batches in flight.
+     * `offWork`: the worker stops fetching and does not wait for the batch in
+     * flight. When the app closes, `PgBoss.layer`'s stop waits for that batch
+     * up to its `stop.timeout`, then interrupts the handler and fails the
+     * batch. Waiting here would hold the app's shutdown for as long as a
+     * handler runs.
      *
      * The handler gets a non-empty batch with decoded payloads, and fails or
      * succeeds as a whole. A payload that does not decode fails the batch.
@@ -299,39 +326,116 @@ export interface Class<Self, Name extends string, S extends PayloadSchema> exten
 export const Service =
     <Self>() =>
     <const Name extends string, S extends PayloadSchema>(
-        _name: Name,
-        _definition: {
+        name: Name,
+        definition: {
             readonly payload: S;
             readonly options?: QueueOptions | undefined;
         },
     ): Class<Self, Name, S> => {
-        // TODO: implement as below.
-        // ```ts
-        // const Key = Context.Service<Self, Registered<Name>>()(`@wmaurer/effect-sql-pg-boss/JobQueue/${name}`)
-        // const codec = Schema.toCodecJson(definition.payload)
-        // return class extends Key {
-        //   static queueName = name; static payload = definition.payload; static options = definition.options ?? {}
-        //   static layer = Layer.effect(Key, gen:
-        //     const boss = yield* PgBoss; const { boss: js } = boss[RuntimeId]
-        //     yield* Connection.call("createQueue", async () => { if (!(await js.getQueue(name))) await js.createQueue(name, options) })
-        //     return { queueName: name, boss })
-        //   static send = (payload, options) => gen:
-        //     const runtime = (yield* Key).boss[RuntimeId]
-        //     const data = yield* Schema.encodeEffect(codec)(payload)
-        //     const id = yield* Connection.withDb(runtime.sql, (db) => Connection.call("send", () => runtime.boss.send(name, data, { ...options, db })))
-        //     return Option.fromNullishOr(id)
-        //   static step = (payload, options) => ({ [StepTypeId]: identity, queueName: name, dependsOn: options?.dependsOn ?? [], job: options?.job, encoded: Schema.encodeEffect(codec)(payload) })
-        //   static worker = (handler, options) => Layer.effectDiscard(gen:
-        //     const runtime = (yield* Key).boss[RuntimeId]
-        //     const { transactional, ...work } = options
-        //     if (transactional) yield* runtime.reserveConnections(name, work.localConcurrency ?? 1)
-        //     const context = yield* Effect.context<R | DecodingServices>()
-        //     const decodeBatch = (jobs) => Effect.forEach(jobs, (job) => Effect.map(Schema.decodeUnknownEffect(codec)(job.data), (data) => toJob(job, data)))
-        //     const id = yield* Connection.call("work", () => runtime.boss.work(name, { ...work, transactional },
-        //       WorkerTransaction.workCallback({ transactional, context, handler: (jobs) => Effect.flatMap(decodeBatch(jobs), handler) })))
-        //     yield* Effect.addFinalizer(() => Effect.promise(() => runtime.boss.offWork(name, { id, wait: true })))
-        //   )
-        // }
-        // ```
-        throw new Error("not implemented");
+        const Key = Context.Service<Self, Registered<Name>>()(`@wmaurer/effect-sql-pg-boss/JobQueue/${name}`);
+        const codec = Schema.toCodecJson(definition.payload);
+        const encode = (payload: S["Type"]) => encodeObject(codec, payload);
+        const decode = Schema.decodeUnknownEffect(codec);
+        const options = definition.options ?? {};
+        const runtimeOf = Effect.map(Key, (queue) => queue.boss[RuntimeId]);
+
+        const decodeJob = (job: Boss.Job<unknown>) =>
+            Effect.map(decode(job.data), (data): Job<S["Type"]> => ({
+                id: JobId.make(job.id),
+                queue: job.name,
+                data,
+                retryCount: job.retryCount,
+                expireInSeconds: job.expireInSeconds,
+            }));
+
+        return class extends Key {
+            static readonly queueName = name;
+            static readonly payload = definition.payload;
+            static readonly options = options;
+
+            static readonly layer = Layer.effect(
+                Key,
+                Effect.gen(function* () {
+                    const boss = yield* PgBoss;
+                    const pgBoss = boss[RuntimeId].boss;
+                    const existing = yield* Connection.call("getQueue", () => pgBoss.getQueue(name));
+                    if (existing === null) {
+                        yield* Connection.call("createQueue", () => pgBoss.createQueue(name, options));
+                    }
+                    return { queueName: name, boss };
+                }),
+            );
+
+            static readonly send = (payload: S["Type"], sendOptions?: SendOptions) =>
+                Effect.gen(function* () {
+                    const runtime = yield* runtimeOf;
+                    const data = yield* encode(payload);
+                    const id = yield* Connection.withDb(runtime.sql, (db) =>
+                        Connection.call("send", () => runtime.boss.send(name, data, { ...sendOptions, db })),
+                    );
+                    return Option.map(Option.fromNullishOr(id), (sent) => JobId.make(sent));
+                });
+
+            static readonly step = <const Refs extends ReadonlyArray<string> = readonly []>(
+                payload: S["Type"],
+                stepOptions?: {
+                    readonly dependsOn?: Refs | undefined;
+                    readonly job?: JobInsertOptions | undefined;
+                },
+            ): Step<Self, NoInfer<Refs>, S["EncodingServices"]> => ({
+                [StepTypeId]: (_: never) => _,
+                queue: Key,
+                queueName: name,
+                dependsOn: stepOptions?.dependsOn ?? [],
+                job: stepOptions?.job ?? {},
+                encoded: encode(payload),
+            });
+
+            static readonly worker = <E, R>(
+                handler: (jobs: Arr.NonEmptyReadonlyArray<Job<S["Type"]>>) => Effect.Effect<void, E, R>,
+                workerOptions: WorkerOptions,
+            ) =>
+                Layer.effectDiscard(
+                    Effect.gen(function* () {
+                        const runtime = yield* runtimeOf;
+                        const { transactional, ...work } = workerOptions;
+                        if (transactional) {
+                            yield* runtime.reserveConnections(name, work.localConcurrency ?? 1);
+                        }
+                        const context = yield* Effect.context<R | S["DecodingServices"]>();
+                        const id = yield* Effect.tryPromise({
+                            try: () =>
+                                runtime.boss.work(
+                                    name,
+                                    { ...work, transactional },
+                                    WorkerTransaction.workCallback({
+                                        transactional,
+                                        context,
+                                        handler: (jobs) =>
+                                            Effect.flatMap(Effect.forEach(jobs, decodeJob), (decoded) =>
+                                                Arr.isReadonlyArrayNonEmpty(decoded) ? handler(decoded) : Effect.void,
+                                            ),
+                                    }),
+                                ),
+                            catch: (cause) => new PgBossError({ operation: "work", cause }),
+                        });
+                        yield* Effect.addFinalizer(() =>
+                            Effect.promise(() => runtime.boss.offWork(name, { id, wait: false })),
+                        );
+                    }),
+                );
+        };
     };
+
+/**
+ * Encodes a payload for pg-boss's `data` column.
+ *
+ * `PayloadSchema` requires an `Encoded` that is an object, and `toCodecJson`
+ * keeps that shape. Its type widens the result to any `Json`.
+ */
+const encodeObject = <S extends PayloadSchema>(
+    codec: Schema.toCodecJson<S>,
+    payload: S["Type"],
+): Effect.Effect<object, Schema.SchemaError, S["EncodingServices"]> =>
+    // SAFETY: the schema's `Encoded` is an object (`PayloadSchema`), and its JSON codec keeps the shape.
+    Effect.map(Schema.encodeEffect(codec)(payload), (json) => json as object);
