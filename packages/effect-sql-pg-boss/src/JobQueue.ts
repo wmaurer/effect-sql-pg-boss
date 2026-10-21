@@ -1,6 +1,7 @@
 import * as Arr from "effect/Array";
 import * as Context from "effect/Context";
 import * as Effect from "effect/Effect";
+import * as FiberSet from "effect/FiberSet";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as Record from "effect/Record";
@@ -390,12 +391,12 @@ export interface Class<
     ) => Step<Self, NoInfer<Refs>, S["EncodingServices"]>;
 
     /**
-     * Works the queue while the layer is alive. Closing the layer calls
-     * `offWork`: the worker stops fetching and does not wait for the batch in
-     * flight. When the app closes, `PgBoss.layer`'s stop waits for that batch
-     * up to its `stop.timeout`, then interrupts the handler and fails the
-     * batch. Waiting here would hold the app's shutdown for as long as a
-     * handler runs.
+     * Works the queue while the layer is alive. Closing the layer stops the
+     * worker fetching and waits until pg-boss has settled the batch in flight,
+     * so every service the handler uses outlives it. The wait lasts up to
+     * `PgBoss.layer`'s `stop.timeout` (no wait when `stop.graceful` is
+     * `false`). Past it, the worker interrupts the handler, waits for it to
+     * end, and pg-boss fails the batch with the interruption as its error.
      *
      * The handler gets a non-empty batch with decoded payloads, and fails or
      * succeeds as a whole. A payload that does not decode fails the batch,
@@ -568,7 +569,8 @@ export const Service =
                         if (transactional) {
                             yield* runtime.reserveConnections(name, work.localConcurrency ?? 1);
                         }
-                        const context = yield* Effect.context<R | S["DecodingServices"]>();
+                        const handlers = yield* FiberSet.make();
+                        const fork = yield* FiberSet.runtime(handlers)<R | S["DecodingServices"]>();
                         const id = yield* Effect.tryPromise({
                             try: () =>
                                 runtime.boss.work(
@@ -576,7 +578,7 @@ export const Service =
                                     { ...work, transactional, includeMetadata: isDeadLetter },
                                     WorkerTransaction.workCallback({
                                         transactional,
-                                        context,
+                                        fork,
                                         handler: (jobs) =>
                                             Effect.flatMap(decodeBatch(jobs), (decoded) =>
                                                 Arr.isReadonlyArrayNonEmpty(decoded) ? run(decoded) : Effect.void,
@@ -585,8 +587,12 @@ export const Service =
                                 ),
                             catch: (cause) => new PgBossError({ operation: "work", cause }),
                         });
+                        const stopWorking = Effect.promise(() => runtime.boss.offWork(name, { id, wait: true }));
                         yield* Effect.addFinalizer(() =>
-                            Effect.promise(() => runtime.boss.offWork(name, { id, wait: false })),
+                            Effect.timeoutOrElse(stopWorking, {
+                                duration: runtime.stopTimeout,
+                                orElse: () => Effect.andThen(FiberSet.clear(handlers), stopWorking),
+                            }),
                         );
                     }),
                 );

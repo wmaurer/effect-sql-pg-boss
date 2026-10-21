@@ -139,6 +139,7 @@ export const layer = (options: Options = {}): Layer.Layer<PgBoss, PgBossError | 
         PgBoss,
         Effect.gen(function* () {
             const { maintenanceConnections, connectionReserve, rollbackTimeout, stop, ...bossOptions } = options;
+            const stopOptions = { graceful: true, timeout: 30_000, ...stop, close: false };
             const sql = yield* PgClient.PgClient;
             const housekeeping = yield* Housekeeping.make(sql.config, maintenanceConnections ?? 4);
             const fork = yield* FiberSet.makeRuntime<never>();
@@ -155,7 +156,7 @@ export const layer = (options: Options = {}): Layer.Layer<PgBoss, PgBossError | 
             boss.on("warning", (warning) => fork(Effect.logWarning("pg-boss", warning.message, warning.data)));
             yield* Effect.acquireRelease(
                 Connection.call("start", () => boss.start()),
-                () => Effect.promise(() => boss.stop({ graceful: true, timeout: 30_000, ...stop, close: false })),
+                () => Effect.promise(() => boss.stop(stopOptions)),
             );
             // SAFETY: `PgClient.make` stores its `PgPoolConfig` as `config`. A `makeClient` config has
             // no `maxConnections` and gets the pool default; transactional workers are unsupported there.
@@ -168,6 +169,7 @@ export const layer = (options: Options = {}): Layer.Layer<PgBoss, PgBossError | 
                 [RuntimeId]: {
                     boss,
                     sql,
+                    stopTimeout: stopOptions.graceful ? stopOptions.timeout : 0,
                     reserveConnections: connectionBudget(maxConnections - (connectionReserve ?? 2)),
                 },
             });

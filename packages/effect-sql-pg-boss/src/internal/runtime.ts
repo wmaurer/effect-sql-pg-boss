@@ -20,6 +20,12 @@ export interface Runtime {
     /** The app's `PgClient`, as the `SqlClient` the routing rule reads the transaction from. */
     readonly sql: SqlClient.SqlClient;
     /**
+     * How long, in milliseconds, a worker layer's release waits for its
+     * handlers before it interrupts them: the stop's timeout, 0 when the stop
+     * is not graceful.
+     */
+    readonly stopTimeout: number;
+    /**
      * Holds `connections` of the PgClient pool for one transactional worker
      * until the scope closes. Each in-flight transactional batch holds one
      * connection for the handler's whole run.

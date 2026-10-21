@@ -18,6 +18,8 @@
  * - The handler is a child of the parked fiber. A rollback interrupts it and
  *   waits for it before `ROLLBACK` runs and before the connection returns to
  *   the pool, so no late handler statement can land in another session.
+ * - Interrupting the fiber that awaits {@link run} interrupts the handler
+ *   child and waits for it.
  * - `commit()` resolves when the parked fiber exits after the real `COMMIT`,
  *   which includes running the app's own `afterCommit` callbacks.
  * - `rollback()` never rejects, is safe to call twice, and gives up after
@@ -42,11 +44,15 @@ import { type Db, dbFor, toDriverError, type TransactionHandle } from "./connect
 import type * as SqlClient from "effect/sql/SqlClient";
 import type * as Boss from "pg-boss";
 
-/** Forks into the PgBoss layer's FiberSet; closing the layer interrupts what is left. */
-export type RunFork = <A, E>(effect: Effect.Effect<A, E>) => Fiber.Fiber<A, E>;
+/** Forks into a FiberSet; closing its scope interrupts what is left. */
+export type RunFork<R = never> = <A, E>(
+    effect: Effect.Effect<A, E, R>,
+    options?: Effect.RunOptions,
+) => Fiber.Fiber<A, E>;
 
 export interface Options {
     readonly sql: SqlClient.SqlClient;
+    /** The PgBoss layer's FiberSet. */
     readonly fork: RunFork;
     /**
      * The context `fork` runs effects in. The handler gets the parked fiber's
@@ -59,7 +65,7 @@ export interface Options {
 
 type Settlement = "commit" | "rollback";
 
-type Submit = <A, E, R>(effect: Effect.Effect<A, E, R>, context: Context.Context<R>) => Promise<Exit.Exit<A, E>>;
+type Submit = <A, E, R>(effect: Effect.Effect<A, E, R>, context: Context.Context<R>) => Effect.Effect<A, E>;
 
 /** A submitted handler, ready to run once it gets the transaction's services. */
 type Submission = (delta: Context.Context<never>) => Effect.Effect<void>;
@@ -91,22 +97,25 @@ export const begin = (options: Options): Promise<TransactionHandle> => {
     let exited = false;
     let abandon: (() => void) | undefined;
 
-    const submit = <A, E, R>(effect: Effect.Effect<A, E, R>, context: Context.Context<R>): Promise<Exit.Exit<A, E>> => {
-        const reply = Deferred.makeUnsafe<Exit.Exit<A, E>>();
-        const submission: Submission = (delta) =>
-            Effect.asVoid(
-                Effect.exit(
-                    Effect.onExit(Effect.provideContext(effect, Context.merge(context, delta)), (exit) =>
-                        Deferred.succeed(reply, exit),
-                    ),
-                ),
-            );
-        if (exited || !Deferred.doneUnsafe(submitted, Exit.succeed(submission))) {
-            return Promise.resolve(closedTransaction);
-        }
-        abandon = () => Deferred.doneUnsafe(reply, Exit.succeed(closedTransaction));
-        return Effect.runPromise(Deferred.await(reply));
-    };
+    const submitTo =
+        (handler: Fiber.Fiber<void>): Submit =>
+        <A, E, R>(effect: Effect.Effect<A, E, R>, context: Context.Context<R>) =>
+            Effect.suspend(() => {
+                const reply = Deferred.makeUnsafe<A, E>();
+                const submission: Submission = (delta) =>
+                    Effect.asVoid(
+                        Effect.exit(
+                            Effect.onExit(Effect.provideContext(effect, Context.merge(context, delta)), (exit) =>
+                                Deferred.done(reply, exit),
+                            ),
+                        ),
+                    );
+                if (exited || !Deferred.doneUnsafe(submitted, Exit.succeed(submission))) {
+                    return closedTransaction;
+                }
+                abandon = () => Deferred.doneUnsafe(reply, closedTransaction);
+                return Effect.onInterrupt(Deferred.await(reply), () => Fiber.interrupt(handler));
+            });
 
     const body = Effect.gen(function* () {
         const context = yield* Effect.context<never>();
@@ -115,7 +124,7 @@ export const begin = (options: Options): Promise<TransactionHandle> => {
             Effect.flatMap(Deferred.await(submitted), (submission) => submission(contextDelta(context, options.base))),
         );
         const db = dbFor(conn, () => settled);
-        submitters.set(db, submit);
+        submitters.set(db, submitTo(handler));
         yield* Deferred.succeed(opened, { db, commit, rollback });
         const decision = yield* Deferred.await(settlement);
         yield* Fiber.interrupt(handler);
@@ -157,24 +166,20 @@ export const begin = (options: Options): Promise<TransactionHandle> => {
 
 /**
  * Runs a transactional handler inside the worker transaction pg-boss handed
- * it as `tx`, as a child of that transaction's parked fiber, with `context`
- * (the worker layer's) underneath the transaction's services.
+ * it as `tx`, as a child of that transaction's parked fiber, with the caller's
+ * context underneath the transaction's services.
  *
- * Rejects when `tx` is not a transaction this module opened: pg-boss handed
- * the handler something else, and running it outside the transaction would
- * commit its writes apart from the job.
+ * Dies when `tx` is not a transaction this module opened: pg-boss handed the
+ * handler something else, and running it outside the transaction would commit
+ * its writes apart from the job.
  */
-export const run = <A, E, R>(
-    tx: Db,
-    effect: Effect.Effect<A, E, R>,
-    context: Context.Context<R>,
-): Promise<Exit.Exit<A, E>> => {
-    const submit = submitters.get(tx);
-    if (submit === undefined) {
-        return Promise.reject(new Error("pg-boss handed a transactional handler a db this library did not open"));
-    }
-    return submit(effect, context);
-};
+export const run = <A, E, R>(tx: Db, effect: Effect.Effect<A, E, R>): Effect.Effect<A, E, R> =>
+    Effect.suspend(() => {
+        const submit = submitters.get(tx);
+        return submit === undefined
+            ? Effect.die(new Error("pg-boss handed a transactional handler a db this library did not open"))
+            : Effect.flatMap(Effect.context<R>(), (context) => submit(effect, context));
+    });
 
 /**
  * The callback a worker registers with `boss.work`. A batch is the unit of
@@ -182,25 +187,28 @@ export const run = <A, E, R>(
  * a whole. Any failure, defect or interruption rejects with `Cause.pretty`,
  * which pg-boss records as the jobs' error.
  *
- * Transactional: the handler runs through {@link run}; pg-boss's abort
- * (expiry, `stop()`) reaches it as the rollback that follows. Otherwise it
- * runs on its own, interrupted by the batch's abort signal.
+ * Each batch runs in a fiber forked with `fork`, the worker's own, so the
+ * worker can interrupt its handlers. Transactional: the fiber runs the
+ * handler through {@link run}; pg-boss's abort (expiry, `stop()`) reaches it
+ * as the rollback that follows. Otherwise the fiber runs the handler,
+ * interrupted by the batch's abort signal.
  */
 export const workCallback =
     <E, R>(options: {
         readonly transactional: boolean;
-        readonly context: Context.Context<R>;
+        readonly fork: RunFork<R>;
         readonly handler: (jobs: ReadonlyArray<Boss.Job<unknown>>) => Effect.Effect<void, E, R>;
     }) =>
     (jobs: Array<Boss.Job<unknown>>, tx?: Db): Promise<void> => {
         const program = options.handler(jobs);
-        const signal = jobs[0]?.signal;
-        const exit = !options.transactional
-            ? Effect.runPromiseExitWith(options.context)(program, signal === undefined ? undefined : { signal })
-            : tx === undefined
-              ? Promise.reject(new Error("pg-boss called a transactional handler without its transaction"))
-              : run(tx, program, options.context);
-        return exit.then((exit) =>
+        const fiber = !options.transactional
+            ? options.fork(program, { signal: jobs[0]?.signal })
+            : options.fork(
+                  tx === undefined
+                      ? Effect.die(new Error("pg-boss called a transactional handler without its transaction"))
+                      : run(tx, program),
+              );
+        return Effect.runPromise(Fiber.await(fiber)).then((exit) =>
             Exit.isFailure(exit) ? Promise.reject(new Error(Cause.pretty(exit.cause))) : undefined,
         );
     };

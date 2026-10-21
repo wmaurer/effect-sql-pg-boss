@@ -1,6 +1,6 @@
 import { PgClient } from "@effect/sql-pg";
 import { assert, layer } from "@effect/vitest";
-import { Array as Arr, Clock, Context, Deferred, Effect, Exit, Layer, Logger, MutableRef, Scope } from "effect";
+import { Array as Arr, Clock, Context, Deferred, Effect, Exit, Layer, Logger, MutableRef, Ref, Scope } from "effect";
 
 import { JobQueue, PgBoss } from "../src/index.ts";
 import * as Connection from "../src/internal/connection.ts";
@@ -29,6 +29,19 @@ class BeginFails extends JobQueue.Service<BeginFails>()("begin-fails", {
     payload: JobData,
     options: { retryLimit: 0 },
 }) {}
+class GateProbe extends JobQueue.Service<GateProbe>()("gate-probe", { payload: JobData }) {}
+class Alone extends JobQueue.Service<Alone>()("alone", { payload: JobData }) {}
+
+/** An app service a handler uses, built after `PgBoss.layer`. Releasing it closes it. */
+class Gate extends Context.Service<Gate, { readonly open: Ref.Ref<boolean> }>()("test/Gate") {}
+
+const GateLive = Layer.effect(
+    Gate,
+    Effect.map(
+        Effect.acquireRelease(Ref.make(true), (open) => Ref.set(open, false)),
+        (open) => Gate.of({ open }),
+    ),
+);
 
 const DATABASE = "pg_boss_layer";
 
@@ -48,7 +61,10 @@ const backendsOf = (applicationName: string) =>
     });
 
 layer(
-    harness({ database: DATABASE }, Layer.mergeAll(UseSend.layer, CommitFails.layer, Shutdown.layer, BeginFails.layer)),
+    harness(
+        { database: DATABASE },
+        Layer.mergeAll(UseSend.layer, CommitFails.layer, Shutdown.layer, BeginFails.layer, Alone.layer),
+    ),
     { excludeTestServices: true, timeout: "60 seconds" },
 )("PgBoss.layer", (it) => {
     it.effect("use passes {} outside a transaction and the transaction's db inside one", () =>
@@ -146,50 +162,132 @@ layer(
         }),
     );
 
-    it.effect("closing the layer while a transactional handler runs rolls it back and closes every connection", () =>
-        Effect.gen(function* () {
-            const applicationName = "pg-boss-shutdown-test";
-            const scope = yield* Scope.make();
-            const handler = yield* timeline;
-            const started = yield* Deferred.make<void>();
-            const worker = Shutdown.worker(
-                () =>
-                    Effect.gen(function* () {
-                        const sql = yield* PgClient.PgClient;
-                        yield* sql`insert into app ${sql.insert({ tag: "shutdown", note: "before-stop" })}`;
-                        yield* Deferred.succeed(started, undefined);
-                        yield* Effect.sleep("60 seconds");
-                        yield* handler.mark("woke up");
-                    }).pipe(Effect.onInterrupt(() => handler.mark("interrupted"))),
-                { transactional: true, pollingIntervalSeconds: 0.5 },
-            );
-            yield* Layer.buildWithScope(
-                worker.pipe(
-                    Layer.provideMerge(Layer.fresh(Shutdown.layer)),
-                    Layer.provideMerge(bossOn({ applicationName }, { stop: { timeout: 2000 } })),
-                ),
-                scope,
-            );
-            yield* sendOutside("shutdown", { tag: "shutdown" });
-            yield* Deferred.await(started);
-            assert.isAbove((yield* backendsOf(applicationName)).length, 1, "both pools hold connections");
+    for (const [transactional, notes] of [
+        [false, ["before-stop"]],
+        [true, []],
+    ] as const) {
+        it.effect(
+            `closing the layer interrupts a handler past the stop timeout and closes every connection (transactional: ${transactional})`,
+            () =>
+                Effect.gen(function* () {
+                    const tag = `shutdown-${transactional}`;
+                    const applicationName = `pg-boss-${tag}`;
+                    const scope = yield* Scope.make();
+                    const handler = yield* timeline;
+                    const started = yield* Deferred.make<void>();
+                    const worker = Shutdown.worker(
+                        () =>
+                            Effect.gen(function* () {
+                                const sql = yield* PgClient.PgClient;
+                                yield* sql`insert into app ${sql.insert({ tag, note: "before-stop" })}`;
+                                yield* Deferred.succeed(started, undefined);
+                                yield* Effect.sleep("60 seconds");
+                                yield* handler.mark("woke up");
+                            }).pipe(Effect.onInterrupt(() => handler.mark("interrupted"))),
+                        { transactional, pollingIntervalSeconds: 0.5 },
+                    );
+                    yield* Layer.buildWithScope(
+                        worker.pipe(
+                            Layer.provideMerge(Layer.fresh(Shutdown.layer)),
+                            Layer.provideMerge(bossOn({ applicationName }, { stop: { timeout: 2000 } })),
+                        ),
+                        scope,
+                    );
+                    yield* sendOutside(Shutdown.queueName, { tag });
+                    yield* Deferred.await(started);
+                    assert.isAbove((yield* backendsOf(applicationName)).length, 1, "both pools hold connections");
 
-            const closing = yield* Clock.currentTimeMillis;
-            yield* Scope.close(scope, Exit.void);
-            const closed = (yield* Clock.currentTimeMillis) - closing;
+                    const closing = yield* Clock.currentTimeMillis;
+                    yield* Scope.close(scope, Exit.void);
+                    const closed = (yield* Clock.currentTimeMillis) - closing;
 
-            assert.isAtLeast(closed, 2000, "the graceful stop gave the handler its timeout");
-            assert.isBelow(closed, 3000, "and closed soon after it");
-            assert.isTrue(yield* handler.reached("interrupted"));
-            assert.isFalse(yield* handler.reached("woke up"));
-            assert.deepStrictEqual(yield* appNotes("shutdown"), []);
-            assert.deepStrictEqual(yield* jobStates("shutdown"), ["shutdown:failed"]);
-            assert.deepStrictEqual((yield* failure("shutdown", "shutdown")).output, {
-                value: "pg-boss shut down while active",
-            });
-            assert.deepStrictEqual(yield* backendsOf(applicationName), [], "no connection of either pool remains");
-        }),
-    );
+                    assert.isAtLeast(closed, 2000, "the worker gave the handler the stop timeout");
+                    assert.isBelow(closed, 3000, "and closed soon after it");
+                    assert.isTrue(yield* handler.reached("interrupted"));
+                    assert.isFalse(yield* handler.reached("woke up"));
+                    assert.deepStrictEqual(yield* appNotes(tag), [...notes]);
+                    assert.deepStrictEqual(yield* jobStates(tag), ["shutdown:failed"]);
+                    const { output } = yield* failure(tag, Shutdown.queueName);
+                    assert.deepStrictEqual(
+                        { name: output?.name, message: output?.message },
+                        {
+                            name: "Error",
+                            message:
+                                "InterruptError: All fibers interrupted without error {\n  [cause]: InterruptCause: The fiber was interrupted by:\n      at fiber (#-1)\n}",
+                        },
+                    );
+                    assert.deepStrictEqual(
+                        yield* backendsOf(applicationName),
+                        [],
+                        "no connection of either pool remains",
+                    );
+                }),
+        );
+    }
+
+    for (const transactional of [false, true] as const) {
+        it.effect(
+            `a handler finishes before the services provided to its worker close (transactional: ${transactional})`,
+            () =>
+                Effect.gen(function* () {
+                    const tag = `gate-${transactional}`;
+                    const scope = yield* Scope.make();
+                    const started = yield* Deferred.make<void>();
+                    const seen = yield* Ref.make<ReadonlyArray<boolean>>([]);
+                    const worker = GateProbe.worker(
+                        () =>
+                            Effect.gen(function* () {
+                                const { open } = yield* Gate;
+                                yield* Deferred.succeed(started, undefined);
+                                yield* Effect.sleep("1500 millis");
+                                yield* Ref.update(seen, Arr.append(yield* Ref.get(open)));
+                            }),
+                        { transactional, pollingIntervalSeconds: 0.5 },
+                    );
+                    yield* Layer.buildWithScope(
+                        worker.pipe(
+                            Layer.provide(GateLive),
+                            Layer.provideMerge(Layer.fresh(GateProbe.layer)),
+                            Layer.provideMerge(bossOn({}, { stop: { timeout: 10_000 } })),
+                        ),
+                        scope,
+                    );
+                    yield* sendOutside(GateProbe.queueName, { tag });
+                    yield* Deferred.await(started);
+                    yield* Scope.close(scope, Exit.void);
+
+                    assert.deepStrictEqual(yield* Ref.get(seen), [true], "the handler saw Gate open");
+                    assert.deepStrictEqual(yield* jobStates(tag), ["gate-probe:completed"]);
+                }),
+        );
+
+        it.effect(`closing a worker on its own waits for its handler (transactional: ${transactional})`, () =>
+            Effect.gen(function* () {
+                const tag = `alone-${transactional}`;
+                const scope = yield* Scope.make();
+                const started = yield* Deferred.make<void>();
+                const handler = yield* timeline;
+                yield* Layer.buildWithScope(
+                    Alone.worker(
+                        () =>
+                            Effect.gen(function* () {
+                                yield* Deferred.succeed(started, undefined);
+                                yield* Effect.sleep("1500 millis");
+                                yield* handler.mark("finished");
+                            }),
+                        { transactional, pollingIntervalSeconds: 0.5 },
+                    ),
+                    scope,
+                );
+                yield* sendOutside(Alone.queueName, { tag });
+                yield* Deferred.await(started);
+                yield* Scope.close(scope, Exit.void);
+
+                assert.isTrue(yield* handler.reached("finished"));
+                assert.deepStrictEqual(yield* jobStates(tag), ["alone:completed"]);
+            }),
+        );
+    }
 
     it.effect("a worker transaction that cannot start fails the job without running the handler", () =>
         Effect.gen(function* () {
