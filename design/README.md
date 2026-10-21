@@ -2,7 +2,7 @@
 
 This document holds everything from the session of 2026-10-20 that designed `@wmaurer/effect-sql-pg-boss`. You can start a new session from this file alone. All supporting files are in this folder, and the paths below are relative to it.
 
-Status: the investigation is finished, and the API sketch is finished and verified. The sketch is ported into `packages/effect-sql-pg-boss/`. `PgBoss.layer`, `PgBoss.layerConfig` and `PgBoss.use` are implemented. The integration suite runs on `effect` 4.0.5 and builds everything through `PgBoss.layer`. `JobQueue` still has TODO bodies.
+Status: the investigation is finished, and the API sketch is finished and verified. The sketch is ported into `packages/effect-sql-pg-boss/` and fully implemented: `PgBoss.layer`, `PgBoss.layerConfig`, `PgBoss.use`, `JobQueue.Service` and `JobQueue.flow`. The integration suite runs on `effect` 4.0.5, builds everything through `PgBoss.layer`, and sends, works and runs flows through the queue classes. The three needs in `consumer-requirements.md` are met: dead-letter metadata, converging queue options, and a per-worker decode failure policy.
 
 ## Contents of the folder
 
@@ -119,12 +119,14 @@ const AppLive = ChargeCardWorker.pipe(
 
 The public surface:
 
-- `JobQueue.Service<Self>()(name, { payload, options? })` declares a queue. The class has these statics:
-    - `queueName`, `payload` and `options`.
-    - `layer` creates the queue if it is missing, when the layer builds.
+- `JobQueue.Service<Self>()(name, { payload, deadLetter?, options? })` declares a queue. The class has these statics:
+    - `queueName`, `payload`, `options` and `deadLetter`.
+    - `layer` creates the queue if it is missing and converges an existing one, when the layer builds. It writes the declared options with `updateQueue` on every build. An option removed from the declaration keeps its stored value, because `updateQueue` leaves absent fields alone. `policy` and `partition` cannot change after creation, so the build fails with a `PgBossError` when the stored value differs from the declared one.
     - `send(payload, options?)` returns `Effect<Option<JobId>, SqlError | PgBossError | SchemaError, Self | ...>`. It is `None` when a singleton or throttle policy drops the job.
     - `step(payload, { dependsOn?, job? })` builds one node of a flow.
-    - `worker(handler, options)` returns a `Layer`. The handler gets a non-empty batch of `Job<A>`. `transactional` is required and has no default. `transactionTimeoutSeconds` exists only when `transactional` is `true`.
+    - `worker(handler, options)` returns a `Layer`. The handler gets a non-empty batch of `Job<A>`. `transactional` is required and has no default. `transactionTimeoutSeconds` exists only when `transactional` is `true`. `onDecodeError` is `"fail"` (the default) or `"drop"`.
+- `deadLetter: true` declares a dead-letter queue. Its handler gets `DeadLetterJob<A>`, a `Job<A>` with a `source` of `{ id, queue, output, retryCount, rootId, createdOn }` read from pg-boss's metadata. A source queue names it by class: `options: { deadLetter: WorkFailed, retryLimit: 3 }`. The source queue's layer then requires the dead-letter queue's layer, which creates that queue first, as pg-boss requires.
+- `onDecodeError: "drop"` logs each job whose payload does not decode at warning level with its `SchemaError`, and runs the handler on the jobs that did. The dropped jobs complete with the batch. When none decode, the handler does not run.
 - `JobQueue.flow(record)` inserts a graph of jobs and returns `{ [ref]: JobId }`. `dependsOn` accepts only the other keys of the same record.
 - `JobQueue.Job<A>` has `id`, `queue`, `data`, `retryCount` and `expireInSeconds`. `JobQueue.JobId` is a branded string with a `Schema`.
 - `PgBoss.layer(options?)` and `PgBoss.layerConfig(...)` need `PgClient.PgClient`. Options are pg-boss constructor options without the connection fields, plus these:
@@ -141,7 +143,10 @@ These mistakes are compile errors, and `packages/effect-sql-pg-boss/test/usage.t
 - a payload that does not match the schema;
 - `transactionTimeoutSeconds` on a non-transactional worker;
 - a worker that does not state `transactional`, or has no options at all;
-- using a queue whose layer is not provided.
+- using a queue whose layer is not provided;
+- reading `source` on a job of a queue that is not a dead-letter queue;
+- a dead-letter queue whose payload differs from its source queue's, or a queue not declared with `deadLetter: true` used as one;
+- using a source queue's layer without its dead-letter queue's layer.
 
 ## How it works inside
 
@@ -158,7 +163,7 @@ These mistakes are compile errors, and `packages/effect-sql-pg-boss/test/usage.t
     7. After the transaction settles, its `Db` rejects every statement.
 - **The maintenance pool** (`internal/housekeeping.ts`). This is a small node-postgres pool built from `PgClient.config`. It runs pg-boss's own statements: migrations, maintenance, BAM, fetch, and settles outside a transaction. App rows never use it. It has `'error'` listeners on the pool and on each checked-out client.
 - **Pool headroom.** Each transactional worker layer reserves `localConcurrency` connections from a budget. The layer fails to build when fewer than `connectionReserve` connections would stay free.
-- **Lifecycle.** The order on release is: `boss.stop({ graceful: true, close: false })`, then the `FiberSet` interrupts leftover worker transactions (they roll back), then the maintenance pool ends. Worker layers call `offWork(name, { id, wait: true })` on release.
+- **Lifecycle.** The order on release is: `boss.stop({ graceful: true, close: false })`, then the `FiberSet` interrupts leftover worker transactions (they roll back), then the maintenance pool ends. Worker layers call `offWork(name, { id, wait: false })` on release. They release before `PgBoss.layer`, so `wait: true` made the app's shutdown wait for a running handler with no bound, and the stop timeout never applied. With `wait: false` the stop waits for the batch up to its timeout, then fails it and interrupts the handler.
 
 ## Runtime evidence for the sketch
 
@@ -184,6 +189,15 @@ These mistakes are compile errors, and `packages/effect-sql-pg-boss/test/usage.t
 - An error on a maintenance connection reaches the app's logger.
 
 Not run yet: shutdown while a handler waits to start.
+
+`test/connection.test.ts` and `test/jobQueue.test.ts` run the `JobQueue` paths:
+
+- The flow script pg-boss sends on a caller's `db` is one `executeSql` call without values, of three statements split on `";\n"`. A pg-boss upgrade that changes the count or the separator fails this test.
+- A flow keeps a caller-chosen id on its parent step, and the app stores that id in its own row before the commit.
+- A flow whose second statement fails rolls back the app's row and the first statement. The Effect fails with `PgBossError`, because pg-boss wraps the driver error (22012) in its own.
+- A queue layer converges `retryLimit` from 1 to 5 on the next build, and fails to build when the stored policy differs from the declared one.
+- With `onDecodeError: "drop"`, a batch of three with one malformed payload completes all three, and the handler sees the two good ones. With `"fail"`, all three fail and the handler never runs. A batch where nothing decodes completes without running the handler.
+- A job that fails past its retries reaches the dead-letter queue. Its handler sees the original payload and the failed job's id, queue, output and retry count.
 
 ## Versions
 
@@ -225,8 +239,8 @@ The synthesis is candidate 3's native direction with candidate 1's queue API. It
 
 1. **Decided: transactional workers are not supported on a `PgClient.makeClient` client, and `PgBoss.layer` does not refuse them.** `PgClient.make` and `PgClient.makeClient` both store the raw options as `config` (`PgClient.ts:186`, `:212`), so nothing public tells the two apart. The headroom check reads `config.maxConnections` through one cast and falls back to 10, the `PgPool` default (`PgPool.ts:162`), so the budget is exact for every pooled client. On `makeClient` a transactional batch would pin the only connection for the handler's run (`PgClient.ts:209`) and stall every other query of the app, and the docs say so.
 2. **Decided: `transactional` is required on every `worker` call.** The two modes differ in what they hold (a connection and an open transaction for the whole handler run) and in what commits together, and the right one depends on the handler. pg-boss defaults to `false` (`src/attorney.ts:480`), so a `true` default would silently diverge from it. A required field ties the headroom build failure to a visible choice, at the cost of one field per worker.
-3. Should a payload that fails to decode go to the dead-letter queue instead of being retried?
-4. Should a queue layer also update the options of an existing queue (`updateQueue`)?
+3. **Decided: a worker chooses with `onDecodeError: "fail" | "drop"`, and `"fail"` is the default.** A best-effort queue must not let one malformed message retry a whole batch, and a queue with a retry policy must treat a decode failure like any other failure. `"deadletter"` is not offered: it needs `perJobResults`, which pg-boss refuses together with `transactional`.
+4. **Decided: a queue layer always converges the options it declares with `updateQueue`.** A declarative layer should converge, and `updateQueue` is idempotent. An option removed from the declaration keeps its stored value, and a changed `policy` or `partition` fails the build, because pg-boss cannot change either.
 5. Is polling acceptable for v0.1, or should `useListenNotify` go through `PgClient.listen` now?
 6. Should the handler be able to store a typed result or error in the job's output?
 
@@ -281,6 +295,6 @@ To typecheck a sketch, run `tsc -p tsconfig.json --noEmit` in its directory. Typ
 
 ## Next step
 
-Steps 1 to 4 are done. `packages/effect-sql-pg-boss/` has the dependencies, the ported `src/`, `PgBoss.layer`, and `test/usage.ts` with the type-level assertions. Its integration suite runs P1, P2, P2b, P5 and the headroom check through `PgBoss.layer` against Postgres 18 (`pnpm test`). The tests register transactional work with `boss.work` and `WorkerTransaction.workCallback`, as `JobQueue.worker` will.
+Steps 1 to 5 are done. `packages/effect-sql-pg-boss/` implements the whole API, and its suite runs P1, P2, P2b, P5 and the headroom check through the queue classes against Postgres 18 (`pnpm test`).
 
-Next, implement `JobQueue.Service` and `JobQueue.flow`, and run the suite again through `ChargeCard.worker` and `ChargeCard.send` instead of the internal helpers.
+Next, the first consumer adopts the package. Open decisions 5 and 6 remain, and issue #1 tracks the committed signal.
