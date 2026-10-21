@@ -150,6 +150,13 @@ export const unstatedOptions = SendWelcomeEmail.worker(() => Effect.void, { batc
 // @ts-expect-error the options argument is required
 export const noOptions = SendWelcomeEmail.worker(() => Effect.void);
 
+// A best-effort worker drops a job whose payload does not decode, so the rest of its batch still runs.
+export const ProgressWorker = AuditLog.worker(() => Effect.void, {
+    transactional: false,
+    batchSize: 50,
+    onDecodeError: "drop",
+});
+
 // Escape hatch.
 export const stats = PgBoss.use((boss) => boss.getQueueStats(ChargeCard.queueName));
 export const cancelCharge = (id: JobQueue.JobId) =>

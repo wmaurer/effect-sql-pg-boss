@@ -115,6 +115,13 @@ export type JobInsertOptions = Omit<Boss.JobInsert, "data">;
  * `perJobResults` and `includeMetadata` are not offered: the first cannot
  * combine with `transactional`, the second would change `Job`'s shape.
  *
+ * `onDecodeError` decides what a payload that does not decode does to its
+ * batch. `"fail"` (the default): the batch fails before the handler runs,
+ * and pg-boss retries every job in it. `"drop"`: each such job is logged at
+ * warning level with its `SchemaError`, the handler gets the jobs that did
+ * decode, and the dropped jobs complete with the batch. When none decode,
+ * the handler does not run and the batch completes.
+ *
  * @since 0.1.0
  * @category models
  */
@@ -132,7 +139,16 @@ export type WorkerOptions = Pick<
     (
         | { readonly transactional: true; readonly transactionTimeoutSeconds?: number }
         | { readonly transactional: false; readonly transactionTimeoutSeconds?: never }
-    );
+    ) & { readonly onDecodeError?: DecodeErrorPolicy };
+
+/**
+ * What a worker does with a job whose payload does not decode. See
+ * {@link WorkerOptions}.
+ *
+ * @since 0.1.0
+ * @category models
+ */
+export type DecodeErrorPolicy = "fail" | "drop";
 
 /**
  * The service a queue class provides: proof the queue exists, plus the
@@ -293,7 +309,8 @@ export interface Class<Self, Name extends string, S extends PayloadSchema> exten
      * handler runs.
      *
      * The handler gets a non-empty batch with decoded payloads, and fails or
-     * succeeds as a whole. A payload that does not decode fails the batch.
+     * succeeds as a whole. A payload that does not decode fails the batch,
+     * or is dropped with `onDecodeError: "drop"`.
      *
      * With `transactional: true`, the handler runs inside the transaction
      * pg-boss opened for the batch. `SqlClient` statements, nested
@@ -354,6 +371,33 @@ export const Service =
                 retryCount: job.retryCount,
                 expireInSeconds: job.expireInSeconds,
             }));
+        const decodeBatchWith: Record<
+            DecodeErrorPolicy,
+            (
+                jobs: ReadonlyArray<Boss.Job<unknown>>,
+            ) => Effect.Effect<ReadonlyArray<Job<S["Type"]>>, Schema.SchemaError, S["DecodingServices"]>
+        > = {
+            fail: (jobs) => Effect.forEach(jobs, decodeJob),
+            drop: (jobs) =>
+                Effect.map(
+                    Effect.forEach(jobs, (job) =>
+                        decodeJob(job).pipe(
+                            Effect.asSome,
+                            Effect.catchTag("SchemaError", (error) =>
+                                Effect.as(
+                                    Effect.logWarning(
+                                        "dropped a job whose payload does not decode",
+                                        { queue: name, id: job.id },
+                                        error,
+                                    ),
+                                    Option.none(),
+                                ),
+                            ),
+                        ),
+                    ),
+                    Arr.getSomes,
+                ),
+        };
 
         return class extends Key {
             static readonly queueName = name;
@@ -401,7 +445,8 @@ export const Service =
                 Layer.effectDiscard(
                     Effect.gen(function* () {
                         const runtime = yield* runtimeOf;
-                        const { transactional, ...work } = workerOptions;
+                        const { transactional, onDecodeError = "fail", ...work } = workerOptions;
+                        const decodeBatch = decodeBatchWith[onDecodeError];
                         if (transactional) {
                             yield* runtime.reserveConnections(name, work.localConcurrency ?? 1);
                         }
@@ -415,7 +460,7 @@ export const Service =
                                         transactional,
                                         context,
                                         handler: (jobs) =>
-                                            Effect.flatMap(Effect.forEach(jobs, decodeJob), (decoded) =>
+                                            Effect.flatMap(decodeBatch(jobs), (decoded) =>
                                                 Arr.isReadonlyArrayNonEmpty(decoded) ? handler(decoded) : Effect.void,
                                             ),
                                     }),
