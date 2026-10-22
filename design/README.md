@@ -2,7 +2,7 @@
 
 This document holds everything from the session of 2026-10-20 that designed `@wmaurer/effect-sql-pg-boss`. You can start a new session from this file alone. All supporting files are in this folder, and the paths below are relative to it.
 
-Status: the investigation is finished, and the API sketch is finished and verified. The sketch is ported into `packages/effect-sql-pg-boss/` and fully implemented: `PgBoss.layer`, `PgBoss.layerConfig`, `PgBoss.use`, `JobQueue.Service` and `JobQueue.flow`. The integration suite runs on `effect` 4.0.5, builds everything through `PgBoss.layer`, and sends, works and runs flows through the queue classes. The three needs in `consumer-requirements.md` are met: dead-letter metadata, converging queue options, and a per-worker decode failure policy.
+Status: the investigation is finished, and the API sketch is finished and verified. The sketch is ported into `packages/effect-sql-pg-boss/` and fully implemented: `PgBoss.layer`, `PgBoss.layerConfig`, `PgBoss.use`, `JobQueue.Service` and `JobQueue.flow`. The integration suite runs on `effect` 4.0.6, builds everything through `PgBoss.layer`, and sends, works and runs flows through the queue classes. The three needs in `consumer-requirements.md` are met: dead-letter metadata, converging queue options, and a per-worker decode failure policy.
 
 ## Contents of the folder
 
@@ -158,7 +158,7 @@ These mistakes are compile errors, and `packages/effect-sql-pg-boss/test/usage.t
     2. The body opens the transaction and hands pg-boss the handle.
     3. The handler runs as a child fiber of the parked fiber. The parked transaction's services win over the worker layer's services.
     4. `rollback()` interrupts the handler before the ROLLBACK runs, so no handler statement can run after the connection goes back to the pool.
-    5. `commit()` resolves when the parked fiber exits after the real COMMIT. The design resolved it earlier, on a committed signal, but that needs `SqlClient.afterCommit` (see "Versions").
+    5. Before it hands pg-boss the handle, the body registers its own `sql.afterCommit` callback, the committed signal. It is the transaction's first callback, so it runs first, right after the real COMMIT and the connection release. `commit()` resolves on that signal and does not wait for the app's own `afterCommit` callbacks. If the parked fiber fails first, as when COMMIT fails, `commit()` rejects with the driver error.
     6. `rollback()` is idempotent, never rejects, and gives up after `rollbackTimeout`.
     7. After the transaction settles, its `Db` rejects every statement.
 - **The maintenance pool** (`internal/housekeeping.ts`). This is a small node-postgres pool built from `PgClient.config`. It runs pg-boss's own statements: migrations, maintenance, BAM, fetch, and settles outside a transaction. App rows never use it. It has `'error'` listeners on the pool and on each checked-out client.
@@ -178,6 +178,8 @@ These mistakes are compile errors, and `packages/effect-sql-pg-boss/test/usage.t
 | P4. Callback order      | The library's committed signal ran before the app's first `afterCommit`.                                                                                                                                                                    |
 | P5. Raw rows and errors | With camelCase `transformResultNames`, pg-boss got `created_on`. `send` and `flow` inside a transaction committed and rolled back with it. A unique violation reached pg-boss as `code=23505` and the Effect as `SqlError/UniqueViolation`. |
 | Headroom                | Reserving past the budget failed at layer build with a clear message.                                                                                                                                                                       |
+
+`test/workerTransaction.test.ts` in the package runs P1, P2, P2b, P3 and P4 through the queue classes and asserts the results above. P1 also checks that an app `afterCommit` in a failed batch never runs. P3 asserts that `commit()` resolves within 1 s and at least 2.5 s before the app's 3 s `afterCommit` finishes. P4 asserts that `commit()` had already resolved 50 ms into the app's first `afterCommit`. Resolving `commit()` on the parked fiber's exit instead fails P3 (3053 ms) and P4, and registering the committed signal after the handler fails P3.
 
 `test/layer.test.ts` in the package runs the paths the prototype did not:
 
@@ -205,8 +207,8 @@ Not run yet: shutdown while a handler waits to start.
 
 - **pg-boss 12.38.0.** This is the latest release on npm (published 2026-10-13, checked on 2026-10-20), and pg-boss master has the same `flow` code. All runtime checks used it. The peer range is `~12.38` because the `flow` split depends on how pg-boss joins statements, and 12.38 is the only version tested at runtime. pg-boss 12.37.1 has the same join (`statements.join(';\n')` at `dist/manager.js:1686`; source checked, not run). So the range could probably widen to `>=12.37.1 <12.39` after one test run on 12.37.1.
 - **Postgres 17.** Nothing in the design depends on Postgres 17. It was the Docker image used for the tests. The full prototype also passed on Postgres 18.6 (`synth-pg18.out`). pg-boss's README requires PostgreSQL 13 or higher.
-- **effect and @effect/sql-pg 4.0.5.** These are the versions in `problem.md` and the current npm release. The prototypes used the Effect repo sources at commit `1b740862e3`. That commit is not 4.0.5. It is `4.0.5-233-g1b740862e3`, 233 commits after the 4.0.5 tag.
-- **No `SqlClient.afterCommit` in 4.0.5.** `afterCommit` arrived in Effect PR #9289, after the 4.0.5 tag. The package targets 4.0.5 anyway, without the committed signal. `commit()` resolves when the parked fiber exits after the COMMIT. P1, P2, P2b, P5 and the headroom check ran again on the real 4.0.5 and passed. P1's `afterCommit` check, P3 and P4 need `afterCommit`, so they are deferred. The committed signal, P3 and P4 return when the peer range moves to the first release that includes #9289. Issue #1 tracks this.
+- **effect and @effect/sql-pg 4.0.6.** The package's peer range is `^4.0.6`. `problem.md` names 4.0.5, the npm release at design time. The prototypes used the Effect repo sources at commit `1b740862e3`, which is `4.0.5-233-g1b740862e3`. 4.0.6 is 99 commits after it, and its `SqlClient.ts` is the same file apart from one semicolon, so `afterCommit` behaves as it did in the prototypes.
+- **`SqlClient.afterCommit` needs 4.0.6.** `afterCommit` arrived in Effect PR #9289, after the 4.0.5 tag. The package first shipped on 4.0.5 without the committed signal, with P1's `afterCommit` check, P3 and P4 deferred. Issue #1 tracked their return, which came with the move to 4.0.6.
 - **pg 8.23.1.** This version was used for the maintenance pool and in pg-boss.
 
 ## The three candidate designs
@@ -268,7 +270,7 @@ None of these is needed. Each one would make the package smaller.
 The prototypes ran with Node 26 type stripping (`node file.ts`). The prototype directories used a `node_modules` with these packages:
 
 - `pg-boss@12.38.0` and `pg@8.23.1`, from npm.
-- `effect` and `@effect/sql-pg`, as symlinks to copies of the Effect repo sources (`packages/effect/src` and `packages/sql/pg/src` at `1b740862e3`, which is `4.0.5-233-g1b740862e3`). In a new repo, install `effect@4.0.5` and `@effect/sql-pg@4.0.5` from npm instead.
+- `effect` and `@effect/sql-pg`, as symlinks to copies of the Effect repo sources (`packages/effect/src` and `packages/sql/pg/src` at `1b740862e3`, which is `4.0.5-233-g1b740862e3`). In a new repo, install `effect@4.0.6` and `@effect/sql-pg@4.0.6` from npm instead.
 
 `types/pg/index.d.ts` is a small stand-in for `@types/pg`. Install `@types/pg` in the real package instead.
 
@@ -297,6 +299,6 @@ To typecheck a sketch, run `tsc -p tsconfig.json --noEmit` in its directory. Typ
 
 ## Next step
 
-Steps 1 to 5 are done. `packages/effect-sql-pg-boss/` implements the whole API, and its suite runs P1, P2, P2b, P5 and the headroom check through the queue classes against Postgres 18 (`pnpm test`).
+Steps 1 to 5 are done. `packages/effect-sql-pg-boss/` implements the whole API, and its suite runs P1 to P5 and the headroom check through the queue classes against Postgres 18 (`pnpm test`).
 
-Next, the first consumer adopts the package. Open decisions 5 and 6 remain, and issue #1 tracks the committed signal.
+Next, the first consumer adopts the package. Open decisions 5 and 6 remain.
