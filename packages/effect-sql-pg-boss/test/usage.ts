@@ -91,8 +91,8 @@ export const selfFlow = JobQueue.flow({
 // @ts-expect-error orderId is a bigint, not a string
 export const badPayload = ChargeCard.send({ orderId: "1", amountCents: 100 });
 
-// A transactional worker: app writes, a nested savepoint and a follow-up job
-// all ride pg-boss's transaction for the batch.
+// A transactional worker: app writes, a nested savepoint, a follow-up job and
+// an afterCommit all ride pg-boss's transaction for the batch.
 export const ChargeCardWorker = ChargeCard.worker(
     Effect.fn("ChargeCardWorker")(function* (jobs) {
         const sql = yield* SqlClient.SqlClient;
@@ -104,6 +104,7 @@ export const ChargeCardWorker = ChargeCard.worker(
                 sql`insert into ledger ${sql.insert({ orderId: job.data.orderId, ref: receipt.ref })}`,
             );
             yield* AuditLog.send({ orderId: job.data.orderId, event: "charged" });
+            yield* sql.afterCommit(Effect.logInfo("order charged", job.data.orderId));
         }
     }),
     { transactional: true, batchSize: 10, localConcurrency: 2 },

@@ -1,10 +1,11 @@
 import { assert, layer } from "@effect/vitest";
-import { Array as Arr, Deferred, Effect, Layer, Option, Record, Ref } from "effect";
+import { Array as Arr, Deferred, Effect, Layer, Option, Record, Ref, Schedule } from "effect";
 
 import { JobQueue } from "../src/index.ts";
 import * as Connection from "../src/internal/connection.ts";
 import {
     appNotes,
+    commitOf,
     failure,
     Harness,
     JobData,
@@ -25,6 +26,7 @@ class P2b extends JobQueue.Service<P2b>()("p2b", {
     payload: JobData,
     options: { retryLimit: 0, expireInSeconds: 1 },
 }) {}
+class P3 extends JobQueue.Service<P3>()("p3", { payload: JobData, options: { retryLimit: 0 } }) {}
 
 const polled = { transactional: true, pollingIntervalSeconds: 0.5 } as const;
 
@@ -63,7 +65,7 @@ const transactionEnd = (lines: ReadonlyArray<string>, tag: string) =>
             ),
     );
 
-layer(harness({ database: "worker_transaction" }, Layer.mergeAll(P1.layer, P1Follow.layer, P2.layer)), {
+layer(harness({ database: "worker_transaction" }, Layer.mergeAll(P1.layer, P1Follow.layer, P2.layer, P3.layer)), {
     excludeTestServices: true,
     timeout: "60 seconds",
 })("the parked worker transaction", (it) => {
@@ -74,6 +76,10 @@ layer(harness({ database: "worker_transaction" }, Layer.mergeAll(P1.layer, P1Fol
             const seen = yield* Ref.make<
                 Record<string, { readonly sameTx: boolean; readonly followId: string; readonly pid: number }>
             >({});
+            const afterCommitSaw = {
+                "p1-ok": yield* Deferred.make<ReadonlyArray<string>>(),
+                "p1-bad": yield* Deferred.make<ReadonlyArray<string>>(),
+            };
             yield* Layer.build(
                 P1.worker(
                     (jobs) =>
@@ -105,6 +111,14 @@ layer(harness({ database: "worker_transaction" }, Layer.mergeAll(P1.layer, P1Fol
                                             pid: row?.pid ?? 0,
                                         }),
                                     );
+                                    yield* sql.afterCommit(
+                                        Effect.flatMap(jobStates(job.tag), (states) =>
+                                            Deferred.succeed(
+                                                afterCommitSaw[job.fail === true ? "p1-bad" : "p1-ok"],
+                                                states,
+                                            ),
+                                        ),
+                                    );
                                     if (job.fail === true) {
                                         yield* handler.mark("failing");
                                         return yield* Effect.die(new Error("handler failed on purpose"));
@@ -124,6 +138,15 @@ layer(harness({ database: "worker_transaction" }, Layer.mergeAll(P1.layer, P1Fol
             assert.deepStrictEqual(yield* jobStates("p1-ok"), ["p1:completed", "p1-follow:created"]);
             assert.deepStrictEqual(yield* appNotes("p1-bad"), []);
             assert.deepStrictEqual(yield* jobStates("p1-bad"), ["p1:failed"]);
+            assert.deepStrictEqual(
+                yield* Deferred.await(afterCommitSaw["p1-ok"]).pipe(Effect.timeout("5 seconds")),
+                ["p1:completed", "p1-follow:created"],
+                "an afterCommit in the handler runs after pg-boss's real COMMIT",
+            );
+            assert.isFalse(
+                yield* Deferred.isDone(afterCommitSaw["p1-bad"]),
+                "a rolled-back batch drops its afterCommit",
+            );
 
             const observed = yield* Ref.get(seen);
             for (const tag of ["p1-ok", "p1-bad"]) {
@@ -247,6 +270,81 @@ layer(harness({ database: "worker_transaction" }, Layer.mergeAll(P1.layer, P1Fol
                     "the handler's insert never reached the server",
                 );
             }
+        }),
+    );
+
+    it.effect("P3, P4: commit() resolves on the library's committed signal, ahead of the app's afterCommit", () =>
+        Effect.gen(function* () {
+            const { sql } = yield* Harness;
+            const handler = yield* timeline;
+            const callbacksDone = yield* Deferred.make<void>();
+            const committedWhenFirstRan = yield* Deferred.make<boolean>();
+            yield* Layer.build(
+                P3.worker(
+                    (jobs) =>
+                        Effect.forEach(
+                            jobs,
+                            ({ data: job }) =>
+                                Effect.gen(function* () {
+                                    yield* sql`insert into app ${sql.insert({ tag: job.tag, note: "p3" })}`;
+                                    yield* sql.afterCommit(
+                                        Effect.gen(function* () {
+                                            yield* Effect.sleep("50 millis");
+                                            yield* Deferred.succeed(
+                                                committedWhenFirstRan,
+                                                Option.isSome(yield* commitOf(job.tag)),
+                                            );
+                                            yield* Effect.sleep("3 seconds");
+                                            yield* handler.mark("afterCommit #1 finished");
+                                        }),
+                                    );
+                                    yield* sql.withTransaction(
+                                        sql.afterCommit(
+                                            Effect.andThen(
+                                                handler.mark("afterCommit #2 (from a savepoint)"),
+                                                Deferred.succeed(callbacksDone, undefined),
+                                            ),
+                                        ),
+                                    );
+                                }),
+                            { discard: true },
+                        ),
+                    polled,
+                ),
+            );
+            yield* sendOutside("p3", { tag: "p3-commit" });
+            yield* waitFor("p3-commit", "p3", "completed");
+            yield* Deferred.await(callbacksDone).pipe(Effect.timeout("10 seconds"));
+            const commit = yield* Effect.flatMap(commitOf("p3-commit"), Effect.fromOption).pipe(
+                Effect.retry(Schedule.spaced("50 millis")),
+                Effect.timeoutOrElse({
+                    duration: "5 seconds",
+                    orElse: () => Effect.die(new Error("pg-boss's commit() of p3-commit never resolved")),
+                }),
+            );
+
+            assert.isBelow(
+                commit.resolvedAt - commit.calledAt,
+                1000,
+                "P3: commit() did not wait for the app's 3 s afterCommit",
+            );
+            const finishedAt = yield* handler.at("afterCommit #1 finished");
+            assert.isAtLeast(
+                finishedAt - commit.resolvedAt,
+                2500,
+                "P3: the app's afterCommit finished about 3 s after commit() resolved",
+            );
+            assert.isTrue(
+                yield* Deferred.await(committedWhenFirstRan),
+                "P4: commit() had resolved when the app's first afterCommit ran, so the committed signal ran first",
+            );
+            assert.isAtLeast(
+                yield* handler.at("afterCommit #2 (from a savepoint)"),
+                finishedAt,
+                "the savepoint's afterCommit ran after the outer level's",
+            );
+            assert.deepStrictEqual(yield* appNotes("p3-commit"), ["p3"]);
+            assert.deepStrictEqual(yield* jobStates("p3-commit"), ["p3:completed"]);
         }),
     );
 });

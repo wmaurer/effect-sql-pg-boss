@@ -6,7 +6,8 @@
  * ```
  * parked fiber (forked into the PgBoss layer's FiberSet)
  *   sql.withTransaction(body)
- *     body: resolve { db, commit, rollback }
+ *     body: afterCommit(committed)          registered first, so it runs first
+ *           resolve { db, commit, rollback }
  *           await settlement
  *           interrupt and await the handler child
  *           settlement = rollback -> fail   (withTransaction runs ROLLBACK)
@@ -20,8 +21,9 @@
  *   the pool, so no late handler statement can land in another session.
  * - Interrupting the fiber that awaits {@link run} interrupts the handler
  *   child and waits for it.
- * - `commit()` resolves when the parked fiber exits after the real `COMMIT`,
- *   which includes running the app's own `afterCommit` callbacks.
+ * - `commit()` resolves on the committed signal, which runs right after the
+ *   real `COMMIT` and the connection release, and does not wait for the app's
+ *   own `afterCommit` callbacks. It rejects when the parked fiber fails first.
  * - `rollback()` never rejects, is safe to call twice, and gives up after
  *   `rollbackTimeout` by interrupting the parked fiber.
  * - The handle's `db` refuses statements once the transaction is settled.
@@ -91,6 +93,7 @@ const toPromise = <A>(effect: Effect.Effect<A, SqlError | RollbackRequested>): P
 
 export const begin = (options: Options): Promise<TransactionHandle> => {
     const opened = Deferred.makeUnsafe<TransactionHandle, SqlError | RollbackRequested>();
+    const committed = Deferred.makeUnsafe<void, SqlError | RollbackRequested>();
     const settlement = Deferred.makeUnsafe<Settlement>();
     const submitted = Deferred.makeUnsafe<Submission>();
     let settled = false;
@@ -118,6 +121,7 @@ export const begin = (options: Options): Promise<TransactionHandle> => {
             });
 
     const body = Effect.gen(function* () {
+        yield* options.sql.afterCommit(Effect.asVoid(Deferred.succeed(committed, undefined)));
         const context = yield* Effect.context<never>();
         const [conn] = Context.getUnsafe(context, options.sql.transactionService);
         const handler = yield* Effect.forkChild(
@@ -139,6 +143,7 @@ export const begin = (options: Options): Promise<TransactionHandle> => {
         exited = true;
         if (Exit.isFailure(exit)) {
             Deferred.doneUnsafe(opened, Exit.failCause(exit.cause));
+            Deferred.doneUnsafe(committed, Exit.failCause(exit.cause));
         }
         abandon?.();
     });
@@ -148,7 +153,7 @@ export const begin = (options: Options): Promise<TransactionHandle> => {
             return Promise.reject(new Error("the worker transaction is already settled"));
         }
         settled = true;
-        return toPromise(Fiber.join(fiber));
+        return toPromise(Deferred.await(committed));
     }
 
     function rollback(): Promise<void> {

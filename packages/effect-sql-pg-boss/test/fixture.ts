@@ -33,10 +33,18 @@ export class Harness extends Context.Service<
         readonly boss: Boss.PgBoss;
         /** The `tx` pg-boss handed each batch, by the tag of the batch's first job. */
         readonly transactions: Ref.Ref<Record<string, Connection.Db>>;
+        /** When pg-boss called each batch's `commit()` and when it resolved, by the batch's tag. */
+        readonly commits: Ref.Ref<Record<string, Commit>>;
         /** What the server logged for one backend, when this run started the server. */
         readonly serverLog: Option.Option<(pid: number) => Effect.Effect<ReadonlyArray<string>>>;
     }
 >()("test/Harness") {}
+
+/** Epoch milliseconds on the live clock. */
+export interface Commit {
+    readonly calledAt: number;
+    readonly resolvedAt: number;
+}
 
 export interface Options {
     /** Names the test file's database. */
@@ -95,6 +103,40 @@ const recordTransactions = (boss: Boss.PgBoss, transactions: Ref.Ref<Record<stri
         })) as typeof boss.work;
 };
 
+/**
+ * Wraps the db pg-boss was given so each worker transaction's `commit()`
+ * resolution is recorded under the tag {@link recordTransactions} recorded
+ * for its `tx`. pg-boss still gets the library's handle, with the same `db`.
+ */
+const recordCommits = (
+    boss: Boss.PgBoss,
+    transactions: Ref.Ref<Record<string, Connection.Db>>,
+    commits: Ref.Ref<Record<string, Commit>>,
+) => {
+    const db = boss.getDb();
+    const begin = db.beginTransaction?.bind(db);
+    if (begin === undefined) return;
+    const record = (tx: Connection.Db, calledAt: number) =>
+        Effect.gen(function* () {
+            const resolvedAt = yield* Clock.currentTimeMillis;
+            const tag = Arr.findFirst(
+                Record.toEntries(yield* Ref.get(transactions)),
+                ([, recorded]) => recorded === tx,
+            );
+            if (Option.isSome(tag)) {
+                yield* Ref.update(commits, Record.set(tag.value[0], { calledAt, resolvedAt }));
+            }
+        });
+    db.beginTransaction = () =>
+        begin().then((handle) => ({
+            ...handle,
+            commit: () => {
+                const calledAt = Effect.runSync(Clock.currentTimeMillis);
+                return handle.commit().then(() => Effect.runSync(record(handle.db, calledAt)));
+            },
+        }));
+};
+
 const harness = Layer.effect(
     Harness,
     Effect.gen(function* () {
@@ -104,11 +146,14 @@ const harness = Layer.effect(
 
         const transactions = yield* Ref.make<Record<string, Connection.Db>>({});
         recordTransactions(boss, transactions);
+        const commits = yield* Ref.make<Record<string, Commit>>({});
+        recordCommits(boss, transactions, commits);
         const container = inject("postgresContainer");
         return Harness.of({
             sql,
             boss,
             transactions,
+            commits,
             serverLog: container === undefined ? Option.none() : Option.some(serverLog(container)),
         });
     }),
@@ -137,6 +182,13 @@ export const transactionOf = (tag: string) =>
     Effect.gen(function* () {
         const { transactions } = yield* Harness;
         return Record.get(yield* Ref.get(transactions), tag);
+    });
+
+/** When pg-boss's `commit()` of the batch whose first job has this tag was called and resolved. */
+export const commitOf = (tag: string) =>
+    Effect.gen(function* () {
+        const { commits } = yield* Harness;
+        return Record.get(yield* Ref.get(commits), tag);
     });
 
 /** Sends a job on pg-boss's own connections, as a producer outside the app would. */
