@@ -6,9 +6,10 @@ Instructions for coding agents working in this repository.
 
 ## What This Repository Is
 
-`effect-sql-pg-boss` brings pg-boss, the Postgres job queue for Node, to Effect. It is a pnpm workspace with one package:
+`effect-sql-pg-boss` brings pg-boss, the Postgres job queue for Node, to Effect. It is a pnpm workspace with the library and one example app:
 
 - `packages/effect-sql-pg-boss`: the library, published as `@wmaurer/effect-sql-pg-boss`. It exports its TypeScript source from `src/index.ts` inside the workspace and builds to `dist/` for publishing. `effect`, `@effect/sql-pg` and `pg-boss` are peer dependencies.
+- `examples/orders`: a private CLI app that runs the library against a Postgres in Docker. Its `README.md` is the tutorial. It is linted and typechecked with the library, and has no tests.
 
 `design/` is the design record: the problem, the investigation, three competing API sketches, and the chosen one in `design/arena/synthesis/`. Start from `design/README.md`. The sketches and prototypes import packages the workspace does not install, so lint and typecheck skip `design/`; read it, but put new code in the package.
 
