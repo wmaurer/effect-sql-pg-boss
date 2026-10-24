@@ -4,7 +4,21 @@
  * only through the layer's runtime.
  */
 import { PgClient } from "@effect/sql-pg";
-import { Array as Arr, Clock, Context, Effect, Layer, Option, Record, Redacted, Ref, Schedule, Schema } from "effect";
+import {
+    Array as Arr,
+    Clock,
+    Context,
+    Effect,
+    Layer,
+    Logger,
+    MutableRef,
+    Option,
+    Record,
+    Redacted,
+    Ref,
+    Schedule,
+    Schema,
+} from "effect";
 import { inject } from "vitest";
 
 import { PgBoss } from "../src/index.ts";
@@ -256,3 +270,38 @@ export const timeline = Effect.map(Ref.make<Record<string, number>>({}), (marks)
         ),
     reached: (event: string) => Effect.map(Ref.get(marks), (all) => Record.has(all, event)),
 }));
+
+/** A logger that keeps each message's arguments. `logged` returns the arguments of one message. */
+export const captureLogs = () => {
+    const logged = MutableRef.make<ReadonlyArray<ReadonlyArray<unknown>>>([]);
+    const logger = Logger.make((options) => {
+        MutableRef.update(logged, Arr.append(Arr.ensure(options.message)));
+    });
+    return {
+        layer: Logger.layer([logger]),
+        logged: (message: string) => Arr.filter(MutableRef.get(logged), (args) => args[0] === message),
+    };
+};
+
+/** Runs `effect` every 50 ms until its result passes `until`, for up to 20 seconds. */
+export const eventually = <A, E, R>(what: string, effect: Effect.Effect<A, E, R>, until: (a: A) => boolean) =>
+    effect.pipe(
+        Effect.repeat({ schedule: Schedule.spaced("50 millis"), until }),
+        Effect.timeoutOrElse({
+            duration: "20 seconds",
+            orElse: () => Effect.die(new Error(`timed out waiting for ${what}`)),
+        }),
+    );
+
+/**
+ * The backends of this application whose last statement was the LISTEN/NOTIFY
+ * listener's `LISTEN` or its heartbeat, read on the ambient `PgClient`.
+ */
+export const listenerPids = (applicationName: string) =>
+    Effect.gen(function* () {
+        const sql = yield* PgClient.PgClient;
+        const rows = yield* sql<{ readonly pid: number }>`select pid from pg_stat_activity
+            where application_name = ${applicationName}
+            and (query like 'LISTEN %' or query like '%pg_listening_channels%') order by pid`;
+        return Arr.map(rows, (row) => row.pid);
+    });

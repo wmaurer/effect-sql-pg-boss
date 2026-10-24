@@ -1,8 +1,8 @@
 import { assert, layer } from "@effect/vitest";
-import { Array as Arr, Deferred, Effect, Layer, Logger, MutableRef, Order, pipe, Ref } from "effect";
+import { Array as Arr, Deferred, Effect, Layer, Order, pipe, Ref } from "effect";
 
 import { JobQueue, PgBoss } from "../src/index.ts";
-import { failure, JobData, layer as harness, maintenanceQuery, sendOutside, waitFor } from "./fixture.ts";
+import { captureLogs, failure, JobData, layer as harness, maintenanceQuery, sendOutside, waitFor } from "./fixture.ts";
 
 /** The stored options of a queue that convergence writes, read on pg-boss's own connections. */
 const storedOptions = (name: string) =>
@@ -52,15 +52,6 @@ const recordBatches = Effect.map(Ref.make<ReadonlyArray<ReadonlyArray<string>>>(
             ),
         ),
 }));
-
-/** A logger that keeps each message's arguments. */
-const captureLogs = () => {
-    const logged = MutableRef.make<ReadonlyArray<ReadonlyArray<unknown>>>([]);
-    const logger = Logger.make((options) => {
-        MutableRef.update(logged, Arr.append(Arr.ensure(options.message)));
-    });
-    return { layer: Logger.layer([logger]), logged: () => MutableRef.get(logged) };
-};
 
 class DeadLetters extends JobQueue.Service<DeadLetters>()("dead-letters", { payload: JobData, deadLetter: true }) {}
 class Charges extends JobQueue.Service<Charges>()("charges", {
@@ -142,10 +133,7 @@ layer(
                 "drop-b:completed",
                 "drop-bad:completed",
             ]);
-            const dropped = Arr.filter(
-                logs.logged(),
-                (message) => message[0] === "dropped a job whose payload does not decode",
-            );
+            const dropped = logs.logged("dropped a job whose payload does not decode");
             assert.deepStrictEqual(
                 Arr.map(dropped, (message) => message[1]),
                 [{ queue: "decode-drop", id: badId }],

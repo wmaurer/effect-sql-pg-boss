@@ -25,6 +25,12 @@ export interface Housekeeping {
 }
 
 /**
+ * The `application_name` of pg-boss's own connections (the maintenance pool
+ * and the LISTEN/NOTIFY session) when the app's `PgClient` sets none.
+ */
+export const applicationName = "@wmaurer/effect-sql-pg-boss";
+
+/**
  * Builds the pool from the app's `PgClient.config`, so both pools reach the
  * same database with the same credentials and the caller configures nothing.
  * A `password` Effect runs per connection, as on the native client.
@@ -75,7 +81,7 @@ const poolConfig = (config: PgClientConfig, max: number): PoolConfig => ({
     database: config.database,
     user: config.username,
     ssl: config.ssl,
-    application_name: config.applicationName ?? "@wmaurer/effect-sql-pg-boss",
+    application_name: config.applicationName ?? applicationName,
     password: passwordOf(config.password),
 });
 
