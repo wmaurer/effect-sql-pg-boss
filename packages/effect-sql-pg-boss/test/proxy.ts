@@ -24,6 +24,10 @@ export interface TcpProxy {
     readonly freezeListeners: () => void;
     /** How many connections have sent a LISTEN. */
     readonly listens: () => number;
+    /** How many of those the client has not hung up on. */
+    readonly openListeners: () => number;
+    /** Sets what happens to connections whose first LISTEN arrives from now on. */
+    readonly setOnListen: (onListen: OnListen) => void;
 }
 
 /** forwarding -> listening (first LISTEN) -> frozen. A destroyed listener stays `listening`. */
@@ -36,13 +40,14 @@ interface Connection {
 }
 
 /** Proxies to the server `target` names; the proxy and its sockets close with the scope. */
-export const make = (target: Redacted.Redacted, onListen: OnListen = "forward") =>
+export const make = (target: Redacted.Redacted, initialOnListen: OnListen = "forward") =>
     Effect.acquireRelease(
         Effect.callback<
             { readonly server: net.Server; readonly connections: () => ReadonlyArray<Connection> } & TcpProxy
         >((resume) => {
             const targetUrl = new URL(Redacted.value(target));
             const connections = MutableRef.make<ReadonlyArray<Connection>>([]);
+            const onListen = MutableRef.make(initialOnListen);
             const listeners = () =>
                 Arr.filter(MutableRef.get(connections), (c) => MutableRef.get(c.state) !== "forwarding");
             const server = net.createServer({ allowHalfOpen: true }, (client) => {
@@ -56,8 +61,8 @@ export const make = (target: Redacted.Redacted, onListen: OnListen = "forward") 
                 const frozen = () => MutableRef.get(state) === "frozen";
                 client.on("data", (chunk) => {
                     if (MutableRef.get(state) === "forwarding" && chunk.includes("LISTEN ")) {
-                        MutableRef.set(state, onListen === "freeze" ? "frozen" : "listening");
-                        if (onListen === "destroy") {
+                        MutableRef.set(state, MutableRef.get(onListen) === "freeze" ? "frozen" : "listening");
+                        if (MutableRef.get(onListen) === "destroy") {
                             client.destroy();
                             upstream.destroy();
                             return;
@@ -88,6 +93,9 @@ export const make = (target: Redacted.Redacted, onListen: OnListen = "forward") 
                             for (const { state } of listeners()) MutableRef.set(state, "frozen");
                         },
                         listens: () => listeners().length,
+                        openListeners: () =>
+                            Arr.filter(listeners(), ({ client }) => !client.readableEnded && !client.destroyed).length,
+                        setOnListen: (next) => MutableRef.set(onListen, next),
                     }),
                 );
             });
