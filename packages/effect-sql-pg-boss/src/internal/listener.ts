@@ -16,6 +16,10 @@
  *   timed-out query on a dead socket into a dead session about 5 s later (its
  *   abort-drain timeout), so a silent drop is found within interval + timeout
  *   + 5 s.
+ * - A LISTEN that PostgreSQL does not confirm within the heartbeat timeout
+ *   counts as a lost session, so a socket that goes silent between connect
+ *   and the LISTEN reply costs connectTimeout + timeout + 5 s, not a stalled
+ *   supervisor or a hung `boss.start()`.
  * - A lost session is logged and replaced after
  *   `min(30 s, 1 s * 2^min(attempt, 5))`; `attempt` resets once a subscribe
  *   succeeds.
@@ -47,7 +51,10 @@ import type { SqlError } from "effect/sql/SqlError";
 /** pg-boss's `IDatabase.listen`, which the layer puts on the `db` it hands pg-boss. */
 export type Listen = NonNullable<Db["listen"]>;
 
-/** How often the heartbeat runs, and how long one may take. pg-boss's own listener uses 10 s and 5 s. */
+/**
+ * How often the heartbeat runs, and how long one round trip may take: a
+ * heartbeat or a LISTEN's confirmation. pg-boss's own listener uses 10 s and 5 s.
+ */
 export interface Heartbeat {
     readonly interval: Duration.Input;
     readonly timeout: Duration.Input;
@@ -74,8 +81,12 @@ interface Subscription {
     readonly notifications: Queue.Dequeue<PgConnection.Notification, SqlError>;
 }
 
-/** The heartbeat found the session alive but no longer listening, or got no answer in time. */
-class ListenerLost extends Data.TaggedError("ListenerLost")<{ readonly reason: string }> {}
+/**
+ * The session got no answer in time, to a heartbeat or to LISTEN, or is alive
+ * but no longer listening. `message`, because pg-boss persists only the
+ * message of a rejected first `listen`.
+ */
+class ListenerLost extends Data.TaggedError("ListenerLost")<{ readonly message: string }> {}
 
 /** pg-boss's own heartbeat statement, run on the listening session. */
 const HEARTBEAT_SQL = `SELECT EXISTS (
@@ -133,7 +144,7 @@ const supervise = Effect.fnUntraced(function* (listener: Listener): Effect.fn.Re
         // resumes the loop, so an intentional close is not logged as a loss.
         const cause = yield* Effect.scoped(
             Effect.gen(function* () {
-                const subscription = yield* subscribe(listener.config, listener.channel);
+                const subscription = yield* subscribe(listener.config, listener.channel, listener.heartbeat.timeout);
                 if (!established) {
                     established = true;
                     yield* Deferred.succeed(listener.subscribed, undefined);
@@ -151,7 +162,8 @@ const supervise = Effect.fnUntraced(function* (listener: Listener): Effect.fn.Re
 
 /**
  * Opens the dedicated session, pins it, and LISTENs on `channel`. Resolves
- * once PostgreSQL confirms the LISTEN.
+ * once PostgreSQL confirms the LISTEN, or fails with `ListenerLost` when that
+ * takes longer than `timeout`.
  *
  * Invariant: when the enclosing scope closes, the socket closes before
  * listen's finalizer runs. `closeUnsafe` marks the session dead, so that
@@ -166,7 +178,8 @@ const supervise = Effect.fnUntraced(function* (listener: Listener): Effect.fn.Re
 const subscribe = Effect.fnUntraced(function* (
     config: PgClientConfig,
     channel: string,
-): Effect.fn.Return<Subscription, SqlError, Scope.Scope> {
+    timeout: Duration.Input,
+): Effect.fn.Return<Subscription, SqlError | ListenerLost, Scope.Scope> {
     // Forked before the connection opens, so it closes after the connection: see the invariant.
     const listenScope = yield* Scope.fork(yield* Scope.Scope);
     const connection = yield* PgConnection.make({
@@ -176,7 +189,14 @@ const subscribe = Effect.fnUntraced(function* (
     // Listen through the pinned view: it is reentrant, so the heartbeat shares the session with
     // the LISTEN instead of queueing behind its pin.
     const session = yield* Scope.provide(connection.pin, listenScope);
-    const notifications = yield* Scope.provide(session.listen(channel), listenScope);
+    // On expiry the driver drains the interrupted LISTEN and, if the socket stays silent, kills the
+    // session 5 s later, so the socket is destroyed before the scope closes.
+    const notifications = yield* Scope.provide(session.listen(channel), listenScope).pipe(
+        Effect.timeoutOrElse({
+            duration: timeout,
+            orElse: () => Effect.fail(new ListenerLost({ message: "PostgreSQL did not confirm LISTEN in time" })),
+        }),
+    );
     return { session, notifications };
 });
 
@@ -213,12 +233,12 @@ const beat = (
     session.query(HEARTBEAT_SQL, [channel]).pipe(
         Effect.timeoutOrElse({
             duration: timeout,
-            orElse: () => Effect.fail(new ListenerLost({ reason: "LISTEN/NOTIFY heartbeat timed out" })),
+            orElse: () => Effect.fail(new ListenerLost({ message: "LISTEN/NOTIFY heartbeat timed out" })),
         }),
         Effect.flatMap((result) =>
             result.rows[0]?.["listening"] === true
                 ? Effect.void
-                : Effect.fail(new ListenerLost({ reason: "LISTEN/NOTIFY channel registration was lost" })),
+                : Effect.fail(new ListenerLost({ message: "LISTEN/NOTIFY channel registration was lost" })),
         ),
     );
 

@@ -5,7 +5,7 @@
  */
 import { PgClient } from "@effect/sql-pg";
 import { assert, it, layer } from "@effect/vitest";
-import { Array as Arr, Clock, Duration, Effect, Exit, Fiber, MutableRef, Redacted, Scope } from "effect";
+import { Array as Arr, Clock, Duration, Effect, Exit, Fiber, MutableRef, Predicate, Redacted, Scope } from "effect";
 import { inject } from "vitest";
 
 import * as Listener from "../src/internal/listener.ts";
@@ -94,6 +94,72 @@ layer(PgClient.layer({ url: server }), { excludeTestServices: true, timeout: "60
             assert.strictEqual(pgBoss.reconnects(), 1);
             assert.lengthOf(pgBoss.logged("pg-boss listener"), 0);
             assert.lengthOf(pgBoss.logged("pg-boss listener callback"), 3);
+        }).pipe(Effect.scoped),
+    );
+
+    it.effect("a first LISTEN that PostgreSQL never confirms rejects listen and hangs up", () =>
+        Effect.gen(function* () {
+            const proxy = yield* Proxy.make(server, "freeze");
+            const pgBoss = pgBossStandIn();
+            const listen = yield* Listener.make({ url: proxy.url }, { interval: "300 millis", timeout: "300 millis" });
+            const rejection = yield* Effect.forkChild(
+                Effect.flip(
+                    Effect.tryPromise({
+                        try: () => listen(CHANNEL, pgBoss.onNotification, pgBoss.onReconnect),
+                        // pg-boss persists only the rejection's message.
+                        catch: (error) => String(Predicate.hasProperty(error, "message") ? error.message : error),
+                    }),
+                ),
+            );
+            yield* eventually("the LISTEN to reach the proxy", Effect.sync(proxy.listens), (n) => n === 1);
+            const frozenAt = yield* Clock.currentTimeMillis;
+
+            const message = yield* Fiber.join(rejection).pipe(
+                Effect.timeoutOrElse({
+                    duration: "10 seconds",
+                    orElse: () => Effect.die(new Error("listen never settled while its LISTEN went unanswered")),
+                }),
+            );
+            const rejectedAfter = (yield* Clock.currentTimeMillis) - frozenAt;
+
+            // 300 ms timeout + the driver's 5 s abort drain.
+            assert.isBelow(rejectedAfter, 6500, `rejected ${rejectedAfter} ms after the freeze`);
+            assert.strictEqual(message, "PostgreSQL did not confirm LISTEN in time");
+            yield* eventually("the listener to hang up", Effect.sync(proxy.openListeners), (n) => n === 0);
+            assert.strictEqual(pgBoss.reconnects(), 0);
+        }).pipe(Effect.scoped),
+    );
+
+    it.effect("a reconnect whose LISTEN PostgreSQL never confirms is logged and retried", () =>
+        Effect.gen(function* () {
+            const sql = yield* PgClient.PgClient;
+            const applicationName = "listener-unconfirmed-reconnect";
+            const proxy = yield* Proxy.make(server);
+            const pgBoss = pgBossStandIn();
+            const listen = yield* Listener.make(
+                { url: proxy.url, applicationName },
+                { interval: "300 millis", timeout: "300 millis" },
+            ).pipe(Effect.provide(pgBoss.layer));
+            yield* Effect.promise(() => listen(CHANNEL, pgBoss.onNotification, pgBoss.onReconnect));
+            const [first] = yield* listenerPids(applicationName);
+            assert.isDefined(first);
+
+            proxy.setOnListen("freeze");
+            yield* sql`select pg_terminate_backend(${first})`;
+            const lostAt = yield* Clock.currentTimeMillis;
+            yield* eventually("the reconnect's LISTEN to reach the proxy", Effect.sync(proxy.listens), (n) => n === 2);
+            proxy.setOnListen("forward");
+            yield* eventually("a second subscribe", Effect.sync(pgBoss.reconnects), (n) => n === 2);
+            const backAfter = (yield* Clock.currentTimeMillis) - lostAt;
+
+            // 1 s backoff + 300 ms timeout + the driver's 5 s abort drain + 2 s backoff.
+            assert.isBelow(backAfter, 10_500, `subscribed again ${backAfter} ms after the loss`);
+            const losses = pgBoss.logged("pg-boss listener");
+            assert.lengthOf(losses, 2);
+            assert.nestedPropertyVal(losses[0]?.[1], "reason.cause.code", "57P01");
+            assert.nestedPropertyVal(losses[1]?.[1], "message", "PostgreSQL did not confirm LISTEN in time");
+            yield* sql`select pg_notify(${CHANNEL}, 'after-unconfirmed')`;
+            yield* eventually("the payload", Effect.sync(pgBoss.payloads), Arr.contains("after-unconfirmed"));
         }).pipe(Effect.scoped),
     );
 
