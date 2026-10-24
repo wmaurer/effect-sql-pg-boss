@@ -9,6 +9,7 @@ import * as Boss from "pg-boss";
 
 import * as Connection from "./internal/connection.ts";
 import * as Housekeeping from "./internal/housekeeping.ts";
+import * as Listener from "./internal/listener.ts";
 import { connectionBudget, type Runtime, RuntimeId } from "./internal/runtime.ts";
 import * as WorkerTransaction from "./internal/workerTransaction.ts";
 
@@ -49,6 +50,21 @@ export class PgBossError extends Schema.TaggedError<PgBossError, { readonly bran
  * @category models
  */
 export interface Options extends Omit<Boss.ConstructorOptions, Exclude<keyof Boss.DatabaseOptions, "schema">> {
+    /**
+     * Wakes the workers of queues created with `notify: true` when a job sent
+     * to them commits, instead of at their next poll. While the wake-ups work,
+     * those workers poll only every 30 seconds (or at their polling interval,
+     * when that is longer) as a backstop.
+     *
+     * Opens one connection of its own from the PgClient's config, outside the
+     * PgClient pool, the maintenance connections and the `connectionReserve`
+     * budget, for as long as pg-boss runs. Works on a `PgClient.makeClient`
+     * client too. The connection checks itself every 10 seconds and is
+     * replaced with backoff when it is lost; each replacement makes every
+     * notify-queue worker fetch once. If the first connect fails, pg-boss
+     * logs `listen_notify_unavailable` and polls. Defaults to false.
+     */
+    readonly useListenNotify?: boolean;
     /**
      * Connections pg-boss uses for polling, maintenance and the settles of
      * non-transactional workers. Separate from the PgClient pool, so handlers
@@ -127,9 +143,10 @@ export const use = <A>(
  * (10 when unset) minus `connectionReserve`. They are not supported on a
  * `PgClient.makeClient` client, where a batch would pin the only connection.
  *
- * Finalizers run in reverse: `boss.stop()` (graceful, `close: false`), then
- * the worker transactions still open are interrupted and roll back, then the
- * maintenance connections close.
+ * Finalizers run in reverse: `boss.stop()` (graceful, `close: false`; it
+ * closes the LISTEN/NOTIFY connection first), then the worker transactions
+ * still open are interrupted and roll back, then the maintenance connections
+ * close.
  *
  * @since 0.1.0
  * @category layers
@@ -142,6 +159,7 @@ export const layer = (options: Options = {}): Layer.Layer<PgBoss, PgBossError | 
             const stopOptions = { graceful: true, timeout: 30_000, ...stop, close: false };
             const sql = yield* PgClient.PgClient;
             const housekeeping = yield* Housekeeping.make(sql.config, maintenanceConnections ?? 4);
+            const listen = yield* Listener.make(sql.config);
             const fork = yield* FiberSet.makeRuntime<never>();
             const base = yield* Effect.context<never>();
             const boss = new Boss.PgBoss({
@@ -150,6 +168,7 @@ export const layer = (options: Options = {}): Layer.Layer<PgBoss, PgBossError | 
                     executeSql: housekeeping.executeSql,
                     beginTransaction: () =>
                         WorkerTransaction.begin({ sql, fork, base, rollbackTimeout: rollbackTimeout ?? "5 seconds" }),
+                    listen,
                 },
             });
             boss.on("error", (error) => fork(Effect.logError("pg-boss", error)));
