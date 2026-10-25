@@ -348,3 +348,7 @@ pg-boss's `error` events go to `Effect.logError`, and its `warning` events go to
 
 - [The orders example](https://github.com/wmaurer/effect-sql-pg-boss/tree/main/examples/orders) is a tutorial. It runs a small order pipeline against Postgres in Docker, with a flow, retries and a dead-letter queue.
 - [The design record](https://github.com/wmaurer/effect-sql-pg-boss/blob/main/design/README.md) explains how the library works and why. It covers the transaction that pg-boss opens for a worker, the alternatives that were rejected, and the decisions behind the API.
+
+## License
+
+MIT. See [`LICENSE`](./LICENSE).
