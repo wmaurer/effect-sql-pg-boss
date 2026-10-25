@@ -1,13 +1,36 @@
 {
     "name": "@wmaurer/effect-sql-pg-boss",
-    "version": "0.0.0",
+    "version": "0.1.0",
+    "description": "Send and work pg-boss jobs inside the @effect/sql-pg transactions of an Effect app",
+    "keywords": [
+        "effect",
+        "job-queue",
+        "jobs",
+        "pg-boss",
+        "postgres",
+        "postgresql",
+        "queue",
+        "transactional-outbox",
+        "typescript"
+    ],
+    "homepage": "https://github.com/wmaurer/effect-sql-pg-boss/tree/main/packages/effect-sql-pg-boss#readme",
+    "bugs": {
+        "url": "https://github.com/wmaurer/effect-sql-pg-boss/issues"
+    },
     "license": "MIT",
     "author": "Wayne Maurer",
+    "repository": {
+        "type": "git",
+        "url": "https://github.com/wmaurer/effect-sql-pg-boss.git",
+        "directory": "packages/effect-sql-pg-boss"
+    },
     "files": [
         "dist",
-        "src"
+        "src",
+        "CHANGELOG.md"
     ],
     "type": "module",
+    "sideEffects": false,
     "exports": {
         ".": "./src/index.ts"
     },
@@ -22,6 +45,7 @@
     },
     "scripts": {
         "build": "tsc -b",
+        "prepack": "node -e \"for (const path of ['dist', 'tsconfig.tsbuildinfo']) fs.rmSync(path, { recursive: true, force: true })\" && tsc -b",
         "test": "vitest run --passWithNoTests"
     },
     "dependencies": {
