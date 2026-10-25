@@ -11,7 +11,7 @@ Instructions for coding agents working in this repository.
 - `packages/effect-sql-pg-boss`: the library, published as `@wmaurer/effect-sql-pg-boss`. It exports its TypeScript source from `src/index.ts` inside the workspace and builds to `dist/` for publishing. `effect`, `@effect/sql-pg` and `pg-boss` are peer dependencies.
 - `examples/orders`: a private CLI app that runs the library against a Postgres in Docker. Its `README.md` is the tutorial. It is linted and typechecked with the library, and has no tests.
 
-`design/` is the design record: the problem, the investigation, three competing API sketches, and the chosen one in `design/arena/synthesis/`. Start from `design/README.md`. The sketches and prototypes import packages the workspace does not install, so lint and typecheck skip `design/`; read it, but put new code in the package.
+`design/README.md` explains how the library works and why: the investigation, the internals, what each test proves, and the API decisions. Read it before you change a decision it records, and update it when you make one. The original sketches and prototypes are at the git tag `design-record`.
 
 ## Effect Source and Docs (`node_modules/`)
 

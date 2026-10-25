@@ -1,8 +1,0 @@
-{"tag":"ok-1792523397777","app":[{"n":"2n"}],"jobs":[{"name":"c3follow","state":"created"},{"name":"c3work","state":"completed"}]}
-{"tag":"bad-1792523397777","app":[],"jobs":[{"name":"c3work","state":"failed"}]}
-handler ok-1792523397777: n=2 (bigint)
-afterCommit ok-1792523397777: job state seen from another connection = completed
-handler bad-1792523397777: n=2 (bigint)
-{"tag":"enq-ok-1792523397777","app":[{"n":"0n"}],"jobs":[{"name":"c3child","state":"created"},{"name":"c3follow","state":"created"},{"name":"c3parent","state":"created"}]}
-{"tag":"enq-bad-1792523397777","app":[],"jobs":[]}
-{"tag":"bare-1792523397777","app":[],"jobs":[{"name":"c3child","state":"created"},{"name":"c3parent","state":"created"}]}
