@@ -1,6 +1,6 @@
 // The README call sites, typechecked by `pnpm typecheck`. Never run: vitest only picks up `*.test.ts`.
 import { PgClient } from "@effect/sql-pg";
-import { Config, Context, Effect, Layer, Option, Schema } from "effect";
+import { Config, Context, Effect, Layer, Option, Schema, String } from "effect";
 import { SqlClient } from "effect/sql";
 
 import { JobQueue, PgBoss } from "../src/index.ts";
@@ -152,7 +152,7 @@ export const unstatedOptions = SendWelcomeEmail.worker(() => Effect.void, { batc
 export const noOptions = SendWelcomeEmail.worker(() => Effect.void);
 
 // A best-effort worker drops a job whose payload does not decode, so the rest of its batch still runs.
-export const ProgressWorker = AuditLog.worker(() => Effect.void, {
+export const AuditLogWorker = AuditLog.worker((jobs) => Effect.logInfo("audit events", jobs.length), {
     transactional: false,
     batchSize: 50,
     onDecodeError: "drop",
@@ -200,6 +200,13 @@ export class NotADeadLetterQueue extends JobQueue.Service<NotADeadLetterQueue>()
     // @ts-expect-error ShipOrder is not declared with deadLetter: true
     options: { deadLetter: ShipOrder },
 }) {}
+
+// A queue whose workers wake when a job commits, on a pg-boss that listens.
+export class Notified extends JobQueue.Service<Notified>()("notified", {
+    payload: Schema.Struct({ orderId: Schema.BigInt }),
+    options: { notify: true },
+}) {}
+export const ListeningBossLive = PgBoss.layer({ useListenNotify: true });
 
 // Escape hatch.
 export const stats = PgBoss.use((boss) => boss.getQueueStats(ChargeCard.queueName));
@@ -292,6 +299,20 @@ const AppWithoutPayments = Layer.mergeAll(ChargeCardWorker, WelcomeEmailWorker).
 );
 assertType<Equals<Layer.Services<typeof AppWithoutPayments>, Payments>>(true);
 assertType<Equals<Layer.Services<typeof AppLive>, never>>(true);
+
+// The quickstart's app layer needs nothing more.
+const QuickstartLive = QuickstartWorker.pipe(
+    Layer.provideMerge(SendWelcomeEmail.layer),
+    Layer.provideMerge(PgBoss.layer()),
+    Layer.provideMerge(
+        PgClient.layerConfig({
+            url: Config.Redacted("DATABASE_URL"),
+            transformQueryNames: Config.succeed(String.camelToSnake),
+            transformResultNames: Config.succeed(String.snakeToCamel),
+        }),
+    ),
+);
+assertType<Equals<Layer.Services<typeof QuickstartLive>, never>>(true);
 
 type BossLayer = typeof BossLive;
 assertType<Equals<BossLayer, Layer.Layer<PgBoss.PgBoss, PgBoss.PgBossError | SqlError, PgClient.PgClient>>>(true);
