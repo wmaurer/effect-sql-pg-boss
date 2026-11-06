@@ -262,7 +262,7 @@ layer(harness({ database: "worker_transaction" }, Layer.mergeAll(P1.layer, P1Fol
                     "LOG:  execute <statement>: select pg_sleep(10)",
                     "ERROR:  canceling statement due to user request",
                     "STATEMENT:  select pg_sleep(10)",
-                    "LOG:  execute <statement>: ROLLBACK",
+                    "LOG:  execute <unnamed>: ROLLBACK",
                 ]);
                 assert.deepStrictEqual(
                     Arr.filter(lines, (line) => line.includes("after-sleep")),

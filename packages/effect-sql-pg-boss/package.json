@@ -52,10 +52,10 @@
         "pg": "^8.23.1"
     },
     "devDependencies": {
-        "@effect/sql-pg": "4.0.6",
-        "@effect/vitest": "4.0.6",
+        "@effect/sql-pg": "4.1.2",
+        "@effect/vitest": "4.1.2",
         "@types/pg": "^8.23.1",
-        "effect": "4.0.6",
+        "effect": "4.1.2",
         "pg-boss": "12.38.0",
         "vitest": "^5.0.5"
     },
